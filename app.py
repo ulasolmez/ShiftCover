@@ -383,57 +383,6 @@ if result is not None:
                     f"{sum(p2.worker_hours):,.0f}")
         mc5.metric("Solve time", f"{p2.elapsed_sec:.1f}s")
 
-    # ── Gantt chart (per occupation) ─────────────────────────────────────
-    st.subheader("Gantt chart")
-    if n_occ > 1:
-        gantt_occ = st.selectbox("Occupation",
-                                 [o.name for o in result.occupations],
-                                 key="gantt_occ")
-        sel_occ = next(o for o in result.occupations
-                       if o.name == gantt_occ)
-    else:
-        sel_occ = result.occupations[0]
-
-    p2 = sel_occ.phase2
-    prefix = sel_occ.name[:3].upper()
-    if p2.worker_schedules:
-        gantt_rows = []
-        for w_idx, sched in enumerate(p2.worker_schedules):
-            emp_id = f"{prefix}-{w_idx+1:03d}"
-            for s in sched:
-                gantt_rows.append({
-                    "Worker": emp_id,
-                    "Day": DAY_NAMES[s.day],
-                    "Start": s.global_start,
-                    "End": s.global_end,
-                    "Shift": s.shift_code,
-                })
-        gdf = pd.DataFrame(gantt_rows)
-        day_color = {d: c for d, c in zip(
-            DAY_NAMES,
-            ["#636EFA", "#EF553B", "#00CC96", "#AB63FA",
-             "#FFA15A", "#19D3F3", "#FF6692"])}
-        fig_g = go.Figure()
-        for _, row in gdf.iterrows():
-            fig_g.add_trace(go.Bar(
-                y=[row["Worker"]], x=[row["End"] - row["Start"]],
-                base=row["Start"], orientation="h",
-                marker_color=day_color.get(row["Day"], "#999"),
-                name=row["Day"], showlegend=False,
-                hovertext=f'{row["Day"]} {row["Shift"]}',
-                hoverinfo="text",
-            ))
-        tick_vals = [d * INTERVALS_PER_DAY for d in range(7)]
-        fig_g.update_xaxes(tickvals=tick_vals, ticktext=DAY_NAMES)
-        n_w = p2.num_workers
-        fig_g.update_layout(
-            height=max(300, 22 * n_w + 80),
-            barmode="stack",
-            margin=dict(l=80, r=20, t=30, b=30),
-            yaxis=dict(autorange="reversed"),
-        )
-        st.plotly_chart(fig_g, use_container_width=True)
-
     # ── Weekly-hours histogram ───────────────────────────────────────────
     st.subheader("Weekly hours distribution")
     all_hrs = []
