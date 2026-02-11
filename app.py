@@ -227,31 +227,43 @@ st.header("3 – Results")
 p1 = result.phase1
 st.subheader("Phase 1 – Set Covering")
 
-mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+mcol1, mcol2, mcol3, mcol4, mcol5, mcol6 = st.columns(6)
 mcol1.metric("Status", p1.status)
 mcol2.metric("Active shifts",
              sum(1 for c in p1.counts if c > 0) if p1.counts else 0)
 total_wh = p1.total_worker_intervals / INTERVALS_PER_HOUR if p1.counts else 0
 mcol3.metric("Total worker-hours", f"{total_wh:,.0f}")
-mcol4.metric("Solve time", f"{p1.elapsed_sec:.1f} s")
+# Headcount = peak simultaneous workers needed (max coverage value)
+peak_headcount = int(p1.coverage.max()) if p1.counts else 0
+mcol4.metric("Peak Headcount", peak_headcount)
+# FTE = total worker-hours / 45
+fte = total_wh / 45.0
+mcol5.metric("FTE (÷45 h)", f"{fte:.1f}")
+mcol6.metric("Solve time", f"{p1.elapsed_sec:.1f} s")
 
 if p1.status not in ("OPTIMAL", "FEASIBLE"):
     st.error(f"Solver returned **{p1.status}** – try relaxing constraints.")
     st.stop()
 
-# ---- Coverage chart ----
+# ---- Coverage chart (weekly overview – filled area) ----
 cov_df = coverage_dataframe(result)
-with st.expander("📈 Demand vs. Coverage", expanded=True):
+with st.expander("📈 Demand vs. Coverage – Full Week", expanded=True):
     fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(
-        x=cov_df["Interval"], y=cov_df["Demand"],
-        mode="lines", name="Demand",
-        line=dict(color="#1f77b4"),
-    ))
+    # Coverage filled area (drawn first so demand line sits on top)
     fig2.add_trace(go.Scatter(
         x=cov_df["Interval"], y=cov_df["Coverage"],
         mode="lines", name="Coverage",
-        line=dict(color="#2ca02c", dash="dot"),
+        line=dict(color="#2ca02c", width=1),
+        fill="tozeroy",
+        fillcolor="rgba(44,160,44,0.25)",
+    ))
+    # Demand filled area
+    fig2.add_trace(go.Scatter(
+        x=cov_df["Interval"], y=cov_df["Demand"],
+        mode="lines", name="Demand",
+        line=dict(color="#1f77b4", width=2),
+        fill="tozeroy",
+        fillcolor="rgba(31,119,180,0.18)",
     ))
     for d in range(1, 7):
         fig2.add_vline(x=d * INTERVALS_PER_DAY, line_dash="dot",
@@ -275,6 +287,72 @@ with st.expander("📈 Demand vs. Coverage", expanded=True):
         f"**Under-coverage:** {under:,} interval-slots"
     )
 
+# ---- Per-day coverage charts (7 separate graphs) ----
+with st.expander("📅 Daily Demand vs. Coverage (7 days)", expanded=True):
+    # build time labels for a single day (00:00 – 23:55)
+    day_time_labels = []
+    for i in range(INTERVALS_PER_DAY):
+        h, m_ = divmod(i * 5, 60)
+        day_time_labels.append(f"{h:02d}:{m_:02d}")
+
+    # iterate days in rows of 2 columns (last row has 1)
+    day_pairs = [(0, 1), (2, 3), (4, 5), (6,)]
+    for pair in day_pairs:
+        cols = st.columns(len(pair))
+        for col_idx, day in enumerate(pair):
+            with cols[col_idx]:
+                start_t = day * INTERVALS_PER_DAY
+                end_t = start_t + INTERVALS_PER_DAY
+                day_demand = cov_df["Demand"].values[start_t:end_t]
+                day_coverage = cov_df["Coverage"].values[start_t:end_t]
+
+                # daily metrics
+                day_peak_hc = int(day_coverage.max())
+                day_total_hrs = float(day_coverage.sum()) / INTERVALS_PER_HOUR
+                day_demand_hrs = float(day_demand.sum()) / INTERVALS_PER_HOUR
+
+                fig_day = go.Figure()
+                fig_day.add_trace(go.Scatter(
+                    x=list(range(INTERVALS_PER_DAY)),
+                    y=day_coverage,
+                    mode="lines", name="Coverage",
+                    line=dict(color="#2ca02c", width=1),
+                    fill="tozeroy",
+                    fillcolor="rgba(44,160,44,0.25)",
+                    hovertext=day_time_labels,
+                ))
+                fig_day.add_trace(go.Scatter(
+                    x=list(range(INTERVALS_PER_DAY)),
+                    y=day_demand,
+                    mode="lines", name="Demand",
+                    line=dict(color="#1f77b4", width=2),
+                    fill="tozeroy",
+                    fillcolor="rgba(31,119,180,0.18)",
+                    hovertext=day_time_labels,
+                ))
+                fig_day.update_layout(
+                    title=dict(
+                        text=(
+                            f"{DAY_NAMES[day]}  —  "
+                            f"Peak HC: {day_peak_hc}  |  "
+                            f"Cov hrs: {day_total_hrs:.0f}  |  "
+                            f"Dem hrs: {day_demand_hrs:.0f}"
+                        ),
+                        font=dict(size=13),
+                    ),
+                    height=260,
+                    margin=dict(l=35, r=10, t=40, b=35),
+                    xaxis=dict(
+                        tickvals=list(range(0, INTERVALS_PER_DAY, 36)),
+                        ticktext=[day_time_labels[i]
+                                  for i in range(0, INTERVALS_PER_DAY, 36)],
+                        tickangle=-45,
+                    ),
+                    yaxis_title="Agents",
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_day, use_container_width=True)
+
 # ---- Shift table ----
 with st.expander("📋 Active Shifts (Phase 1)"):
     shift_df = shifts_to_dataframe(p1)
@@ -292,13 +370,18 @@ elif p2.status not in ("OPTIMAL", "FEASIBLE"):
                "need relaxed constraints (increase weekly-hour window).")
 else:
     st.subheader("Phase 2 – Worker Assignment")
-    wcol1, wcol2, wcol3 = st.columns(3)
-    wcol1.metric("Workers needed", p2.num_workers)
+    wcol1, wcol2, wcol3, wcol4, wcol5 = st.columns(5)
+    wcol1.metric("Headcount (workers)", p2.num_workers)
+    avg_wh = np.mean(p2.worker_hours) if p2.worker_hours else 0
     wcol2.metric(
         "Avg weekly hours",
-        f"{np.mean(p2.worker_hours):.1f}" if p2.worker_hours else "–"
+        f"{avg_wh:.1f}" if p2.worker_hours else "–"
     )
-    wcol3.metric("Solve time", f"{p2.elapsed_sec:.1f} s")
+    total_assigned_hrs = sum(p2.worker_hours) if p2.worker_hours else 0
+    fte_p2 = total_assigned_hrs / 45.0
+    wcol3.metric("FTE (÷45 h)", f"{fte_p2:.1f}")
+    wcol4.metric("Total assigned hours", f"{total_assigned_hrs:,.0f}")
+    wcol5.metric("Solve time", f"{p2.elapsed_sec:.1f} s")
 
     sched_df = schedules_to_dataframe(p2)
 
