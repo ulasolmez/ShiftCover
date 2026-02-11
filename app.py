@@ -67,9 +67,6 @@ with st.sidebar:
     max_weekly = col4.number_input("Max weekly (h)", 0.0, 80.0, 50.0, 1.0)
 
     st.subheader("Worker Constraints")
-    max_shifts_day = st.number_input(
-        "Max shifts per day per worker", 1, 3, 1
-    )
     min_rest = st.number_input(
         "Min rest between shifts (h)", 0.0, 24.0, 12.0, 1.0,
         help="Legal minimum rest period between consecutive shifts",
@@ -217,7 +214,6 @@ if st.button("🚀 Run Optimiser", type="primary"):
         shift_duration_step_min=dur_step,
         min_weekly_hours=min_weekly,
         max_weekly_hours=max_weekly,
-        max_shifts_per_day_per_worker=max_shifts_day,
         min_rest_hours=min_rest,
         max_unique_shifts=max_unique,
         transition_penalty=transition_pen,

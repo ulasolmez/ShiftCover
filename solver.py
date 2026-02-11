@@ -85,7 +85,6 @@ class SolverParams:
     shift_duration_step_min: int = 30           # duration step
     min_weekly_hours: float = 40.0
     max_weekly_hours: float = 50.0
-    max_shifts_per_day_per_worker: int = 1
     min_rest_hours: float = 12.0               # minimum rest between shifts
     max_unique_shifts: int = 0                  # 0 = unlimited
     transition_penalty: int = 50               # cost multiplier per entry/exit
@@ -342,10 +341,9 @@ def _can_assign(worker_shifts: List[CandidateShift],
     Check whether *shift* can be added to a worker who already has
     *worker_shifts*.  Rules:
       1. Worker hasn't exceeded max weekly hours.
-      2. Worker has at most max_shifts_per_day on this day.
-      3. At least min_rest_hours gap between the end of any existing
+      2. At least min_rest_hours gap between the end of any existing
          shift and the start of this one (and vice-versa).
-      4. Shifts must not overlap.
+      3. Shifts must not overlap.
     """
     rest_intervals = int(params.min_rest_hours * INTERVALS_PER_HOUR)
     max_intervals = int(params.max_weekly_hours * INTERVALS_PER_HOUR)
@@ -353,11 +351,6 @@ def _can_assign(worker_shifts: List[CandidateShift],
     # weekly hours check
     current_total = sum(s.duration_intervals for s in worker_shifts)
     if current_total + shift.duration_intervals > max_intervals:
-        return False
-
-    # per-day count
-    day_count = sum(1 for s in worker_shifts if s.day == shift.day)
-    if day_count >= params.max_shifts_per_day_per_worker:
         return False
 
     # overlap & rest gap
