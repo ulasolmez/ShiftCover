@@ -562,27 +562,29 @@ def coverage_dataframe(result: FullResult) -> pd.DataFrame:
 
 def shift_type_summary(p1: PhaseOneResult) -> pd.DataFrame:
     """
-    Shift types in HHMM-HHMM format with count per day and totals.
+    Shift types in HHMM-HHMM format with duration, days used, and total count.
     """
     from collections import defaultdict
-    type_day: Dict[str, Dict[str, int]] = defaultdict(lambda: {d: 0 for d in DAY_NAMES})
+    DAY_ABBR = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+    type_day: Dict[str, Dict[int, int]] = defaultdict(lambda: {d: 0 for d in range(7)})
     type_dur: Dict[str, float] = {}
 
     for s, cnt in zip(p1.shifts, p1.counts):
         if cnt > 0:
             code = s.shift_code
-            type_day[code][DAY_NAMES[s.day]] += cnt
+            type_day[code][s.day] += cnt
             type_dur[code] = s.duration_hours
 
     rows = []
     for code in sorted(type_day.keys()):
-        row = {"ShiftType": code, "Duration(h)": type_dur[code]}
-        total = 0
-        for d in DAY_NAMES:
-            row[d] = type_day[code][d]
-            total += type_day[code][d]
-        row["Total"] = total
-        rows.append(row)
+        days_used = [DAY_ABBR[d] for d in range(7) if type_day[code][d] > 0]
+        total = sum(type_day[code][d] for d in range(7))
+        rows.append({
+            "ShiftType": code,
+            "Duration(h)": type_dur[code],
+            "Days": ",".join(days_used),
+            "Total": total,
+        })
     return pd.DataFrame(rows)
 
 
