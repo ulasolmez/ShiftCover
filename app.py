@@ -287,71 +287,75 @@ with st.expander("📈 Demand vs. Coverage – Full Week", expanded=True):
         f"**Under-coverage:** {under:,} interval-slots"
     )
 
-# ---- Per-day coverage charts (7 separate graphs) ----
-with st.expander("📅 Daily Demand vs. Coverage (7 days)", expanded=True):
+# ---- Per-day coverage chart (dropdown selector) ----
+with st.expander("📅 Daily Demand vs. Coverage", expanded=True):
     # build time labels for a single day (00:00 – 23:55)
     day_time_labels = []
     for i in range(INTERVALS_PER_DAY):
         h, m_ = divmod(i * 5, 60)
         day_time_labels.append(f"{h:02d}:{m_:02d}")
 
-    # iterate days in rows of 2 columns (last row has 1)
-    day_pairs = [(0, 1), (2, 3), (4, 5), (6,)]
-    for pair in day_pairs:
-        cols = st.columns(len(pair))
-        for col_idx, day in enumerate(pair):
-            with cols[col_idx]:
-                start_t = day * INTERVALS_PER_DAY
-                end_t = start_t + INTERVALS_PER_DAY
-                day_demand = cov_df["Demand"].values[start_t:end_t]
-                day_coverage = cov_df["Coverage"].values[start_t:end_t]
+    selected_day_name = st.selectbox(
+        "Select day", DAY_NAMES, index=0, key="day_selector"
+    )
+    day = DAY_NAMES.index(selected_day_name)
 
-                # daily metrics
-                day_peak_hc = int(day_coverage.max())
-                day_total_hrs = float(day_coverage.sum()) / INTERVALS_PER_HOUR
-                day_demand_hrs = float(day_demand.sum()) / INTERVALS_PER_HOUR
+    start_t = day * INTERVALS_PER_DAY
+    end_t = start_t + INTERVALS_PER_DAY
+    day_demand = cov_df["Demand"].values[start_t:end_t]
+    day_coverage = cov_df["Coverage"].values[start_t:end_t]
 
-                fig_day = go.Figure()
-                fig_day.add_trace(go.Scatter(
-                    x=list(range(INTERVALS_PER_DAY)),
-                    y=day_coverage,
-                    mode="lines", name="Coverage",
-                    line=dict(color="#2ca02c", width=1),
-                    fill="tozeroy",
-                    fillcolor="rgba(44,160,44,0.25)",
-                    hovertext=day_time_labels,
-                ))
-                fig_day.add_trace(go.Scatter(
-                    x=list(range(INTERVALS_PER_DAY)),
-                    y=day_demand,
-                    mode="lines", name="Demand",
-                    line=dict(color="#1f77b4", width=2),
-                    fill="tozeroy",
-                    fillcolor="rgba(31,119,180,0.18)",
-                    hovertext=day_time_labels,
-                ))
-                fig_day.update_layout(
-                    title=dict(
-                        text=(
-                            f"{DAY_NAMES[day]}  —  "
-                            f"Peak HC: {day_peak_hc}  |  "
-                            f"Cov hrs: {day_total_hrs:.0f}  |  "
-                            f"Dem hrs: {day_demand_hrs:.0f}"
-                        ),
-                        font=dict(size=13),
-                    ),
-                    height=260,
-                    margin=dict(l=35, r=10, t=40, b=35),
-                    xaxis=dict(
-                        tickvals=list(range(0, INTERVALS_PER_DAY, 36)),
-                        ticktext=[day_time_labels[i]
-                                  for i in range(0, INTERVALS_PER_DAY, 36)],
-                        tickangle=-45,
-                    ),
-                    yaxis_title="Agents",
-                    showlegend=False,
-                )
-                st.plotly_chart(fig_day, use_container_width=True)
+    # daily metrics row
+    day_peak_hc = int(day_coverage.max())
+    day_total_hrs = float(day_coverage.sum()) / INTERVALS_PER_HOUR
+    day_demand_hrs = float(day_demand.sum()) / INTERVALS_PER_HOUR
+    day_over = int(np.clip(day_coverage - day_demand, 0, None).sum())
+    day_under = int(np.clip(day_demand - day_coverage, 0, None).sum())
+
+    dc1, dc2, dc3, dc4, dc5 = st.columns(5)
+    dc1.metric("Peak Headcount", day_peak_hc)
+    dc2.metric("Coverage hrs", f"{day_total_hrs:.0f}")
+    dc3.metric("Demand hrs", f"{day_demand_hrs:.0f}")
+    dc4.metric("Over-coverage", f"{day_over:,} slots")
+    dc5.metric("Under-coverage", f"{day_under:,} slots")
+
+    fig_day = go.Figure()
+    fig_day.add_trace(go.Scatter(
+        x=list(range(INTERVALS_PER_DAY)),
+        y=day_coverage,
+        mode="lines", name="Coverage",
+        line=dict(color="#2ca02c", width=1.5),
+        fill="tozeroy",
+        fillcolor="rgba(44,160,44,0.25)",
+        hovertext=day_time_labels,
+    ))
+    fig_day.add_trace(go.Scatter(
+        x=list(range(INTERVALS_PER_DAY)),
+        y=day_demand,
+        mode="lines", name="Demand",
+        line=dict(color="#1f77b4", width=2),
+        fill="tozeroy",
+        fillcolor="rgba(31,119,180,0.18)",
+        hovertext=day_time_labels,
+    ))
+    fig_day.update_layout(
+        title=dict(
+            text=f"{selected_day_name}",
+            font=dict(size=16),
+        ),
+        height=420,
+        margin=dict(l=50, r=20, t=45, b=50),
+        xaxis=dict(
+            tickvals=list(range(0, INTERVALS_PER_DAY, 12)),  # every hour
+            ticktext=[day_time_labels[i]
+                      for i in range(0, INTERVALS_PER_DAY, 12)],
+            tickangle=-45,
+            title="Time of day",
+        ),
+        yaxis_title="Agents",
+        legend=dict(orientation="h", y=1.10),
+    )
+    st.plotly_chart(fig_day, use_container_width=True)
 
 # ---- Shift table ----
 with st.expander("📋 Active Shifts (Phase 1)"):
