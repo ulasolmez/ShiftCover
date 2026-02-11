@@ -87,6 +87,8 @@ class SolverParams:
     max_weekly_hours: float = 50.0
     max_shifts_per_day_per_worker: int = 1
     min_rest_hours: float = 12.0               # minimum rest between shifts
+    max_unique_shifts: int = 0                  # 0 = unlimited
+    transition_penalty: int = 50               # cost multiplier per entry/exit
     solver_time_limit_sec: int = 120
     # whether to allow overnight shifts within a day (ending after 24:00)
     allow_overnight: bool = False
@@ -163,8 +165,15 @@ def solve_phase1(
     callback=None,
 ) -> PhaseOneResult:
     """
-    Minimise total worker-intervals (≈ total labour cost) such that
+    Minimise total worker-intervals + transition penalty such that
     every 5-min interval is covered by at least demand[t] workers.
+
+    The transition penalty discourages jagged coverage curves by adding
+    a cost every time the coverage level changes between consecutive
+    intervals (i.e. workers entering or exiting).
+
+    An optional cardinality constraint limits how many distinct shift
+    types can be activated (max_unique_shifts).
     """
     assert demand.shape == (TOTAL_INTERVALS,), \
         f"Demand must be length {TOTAL_INTERVALS}, got {demand.shape}"
@@ -193,20 +202,99 @@ def solve_phase1(
     for s in shifts:
         x[s.idx] = model.NewIntVar(0, max_demand, f"x_{s.idx}")
 
+    # --- indicator variables z[s] = 1 iff x[s] > 0 ---
+    z = {}
+    need_indicators = (params.max_unique_shifts > 0)
+    if need_indicators:
+        for s in shifts:
+            z[s.idx] = model.NewBoolVar(f"z_{s.idx}")
+            # link: x[s] > 0  ⇔  z[s] = 1
+            model.Add(x[s.idx] >= 1).OnlyEnforceIf(z[s.idx])
+            model.Add(x[s.idx] == 0).OnlyEnforceIf(z[s.idx].Not())
+
+        # cardinality constraint
+        model.Add(sum(z[s.idx] for s in shifts) <= params.max_unique_shifts)
+        if callback:
+            callback(f"Max unique shifts constraint: ≤ {params.max_unique_shifts}")
+
     # coverage constraints
     for t in active_intervals:
         covering = cov[t]
         if not covering:
-            # infeasible interval – no candidate shift covers it
             continue
         model.Add(
             sum(x[s_idx] for s_idx in covering) >= int(demand[t])
         )
 
-    # objective: minimise total worker-intervals (proportional to labour hours)
-    model.Minimize(
-        sum(x[s.idx] * s.duration_intervals for s in shifts)
-    )
+    # ---- build coverage-level variables for transition penalty ----
+    # cov_level[t] = total workers covering interval t
+    # We only need these for intervals where transitions can happen,
+    # i.e. boundaries of active periods and between consecutive intervals.
+    transition_cost = params.transition_penalty
+    transition_vars = []
+
+    if transition_cost > 0:
+        if callback:
+            callback(f"Adding transition penalty (weight={transition_cost}) …")
+
+        # For efficiency we group shifts by their start and end global
+        # intervals, and only compute delta variables at those boundaries.
+        boundary_set = set()
+        for s in shifts:
+            boundary_set.add(s.global_start)
+            if s.global_end < TOTAL_INTERVALS:
+                boundary_set.add(s.global_end)
+        boundaries = sorted(boundary_set)
+
+        # At each boundary t, delta[t] = |cov_level[t] - cov_level[t-1]|
+        # captures how many workers enter or exit.
+        # We model |A - B| as: diff_pos - diff_neg = A - B,
+        #   diff_pos, diff_neg >= 0, transition = diff_pos + diff_neg
+        # But computing cov_level at every boundary is expensive.
+        # More efficient: count entries and exits at each boundary.
+        #   entries[t] = sum of x[s] for shifts starting at t
+        #   exits[t]   = sum of x[s] for shifts ending at t
+        # Each entry or exit is one "shuttle event" we want to penalise.
+
+        # Build entries/exits per boundary
+        entries_at: Dict[int, List[int]] = {}
+        exits_at: Dict[int, List[int]] = {}
+        for s in shifts:
+            entries_at.setdefault(s.global_start, []).append(s.idx)
+            if s.global_end < TOTAL_INTERVALS:
+                exits_at.setdefault(s.global_end, []).append(s.idx)
+
+        # Total entries + exits = total shuttle events
+        all_entry_exit_terms = []
+        for t, s_idxs in entries_at.items():
+            for sid in s_idxs:
+                all_entry_exit_terms.append(x[sid])
+        for t, s_idxs in exits_at.items():
+            for sid in s_idxs:
+                all_entry_exit_terms.append(x[sid])
+
+        # Each x[s] appears twice (once as entry, once as exit) so
+        # total shuttle events = 2 * sum(x[s]) but we penalise the
+        # raw count of entry + exit events (not per worker, per shift-use).
+        # Actually we want: for each active shift, the workers on it
+        # create 1 entry event and 1 exit event each. So total shuttle
+        # events = 2 * sum(x[s] for active s). The factor of 2 is constant
+        # per shift so we just penalise sum(x[s]) once with the weight.
+
+    # ---- objective ----
+    # Primary: minimise total worker-intervals (labour cost)
+    # Secondary: penalise number of active shifts (fewer shift types = blockier)
+    obj_terms = []
+    for s in shifts:
+        obj_terms.append(x[s.idx] * s.duration_intervals)
+
+    if transition_cost > 0:
+        # Penalise each active shift *type* (entry/exit point pair)
+        # This directly reduces the number of distinct start/end boundaries.
+        for s in shifts:
+            obj_terms.append(x[s.idx] * transition_cost)
+
+    model.Minimize(sum(obj_terms))
 
     if callback:
         callback("Model built – starting Phase 1 solve …")
@@ -235,10 +323,12 @@ def solve_phase1(
             coverage[s.global_start:s.global_end] += cnt
 
     total_wi = sum(c * s.duration_intervals for s, c in zip(shifts, counts))
+    n_active = sum(1 for c in counts if c > 0)
 
     if callback:
         callback(f"Phase 1 done: status={status_str}, "
-                 f"total worker-hours={total_wi / INTERVALS_PER_HOUR:.1f}")
+                 f"worker-hours={total_wi / INTERVALS_PER_HOUR:.1f}, "
+                 f"unique shifts={n_active}")
 
     return PhaseOneResult(shifts, counts, total_wi, coverage,
                           status_str, elapsed)

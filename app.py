@@ -44,6 +44,11 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     min_shift = col1.number_input("Min shift (h)", 1.0, 12.0, 3.0, 0.5)
     max_shift = col2.number_input("Max shift (h)", 1.0, 16.0, 12.0, 0.5)
+    max_unique = st.number_input(
+        "Max unique shift types (0 = unlimited)", 0, 200, 0, 1,
+        help="Limit distinct shift patterns to produce a blockier, "
+             "smoother coverage curve with fewer entry/exit events",
+    )
 
     st.subheader("Start-Time / Duration Granularity")
     start_gran = st.selectbox(
@@ -72,6 +77,11 @@ with st.sidebar:
 
     st.subheader("Solver")
     time_limit = st.slider("Time limit per phase (s)", 10, 600, 120, 10)
+    transition_pen = st.slider(
+        "Transition penalty", 0, 500, 50, 10,
+        help="Higher = fewer entry/exit events = blockier coverage. "
+             "0 = no penalty (jagged but cheapest labour cost)",
+    )
 
     st.divider()
     run_phase2 = st.checkbox("Run Phase 2 (worker assignment)", value=True,
@@ -209,6 +219,8 @@ if st.button("🚀 Run Optimiser", type="primary"):
         max_weekly_hours=max_weekly,
         max_shifts_per_day_per_worker=max_shifts_day,
         min_rest_hours=min_rest,
+        max_unique_shifts=max_unique,
+        transition_penalty=transition_pen,
         solver_time_limit_sec=time_limit,
     )
 
