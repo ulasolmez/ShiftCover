@@ -78,7 +78,9 @@ st.header("1 – Demand Curve")
 
 tab_upload, tab_sample = st.tabs(["📁 Upload file", "🎲 Use sample data"])
 
-demand: np.ndarray | None = None
+# Persist demand across reruns
+if "demand" not in st.session_state:
+    st.session_state["demand"] = None
 
 with tab_upload:
     st.markdown(textwrap.dedent("""\
@@ -123,11 +125,12 @@ with tab_upload:
                         f"❌ Need {TOTAL_INTERVALS} rows, got {len(vals)}."
                     )
                 else:
-                    demand = np.round(vals[:TOTAL_INTERVALS]).astype(int)
+                    st.session_state["demand"] = np.round(vals[:TOTAL_INTERVALS]).astype(int)
+                    d_arr = st.session_state["demand"]
                     st.success(
                         f"✅ Loaded **{demand_col}** column — "
-                        f"min {demand.min()}, max {demand.max()}, "
-                        f"mean {demand.mean():.1f}"
+                        f"min {d_arr.min()}, max {d_arr.max()}, "
+                        f"mean {d_arr.mean():.1f}"
                     )
         except Exception as exc:
             st.error(f"❌ Error reading file: {exc}")
@@ -138,10 +141,13 @@ with tab_sample:
     peak = scol1.slider("Peak agents", 5, 100, 25)
     base = scol2.slider("Base agents", 0, 20, 2)
     if st.button("Generate sample"):
-        demand = generate_sample_demand(peak_agents=peak, base_agents=base)
+        st.session_state["demand"] = generate_sample_demand(
+            peak_agents=peak, base_agents=base
+        )
         st.success("✅ Sample demand generated")
 
 # ── Show demand chart ────────────────────────────────────────────────────────
+demand = st.session_state["demand"]
 if demand is not None:
     with st.expander("📈 Preview demand curve", expanded=True):
         x_labels = []
