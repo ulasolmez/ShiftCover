@@ -293,15 +293,17 @@ def solve_phase2(
     callback=None,
 ) -> PhaseTwoResult:
     """
-    Greedy worker-assignment with minimum-rest enforcement.
+    Greedy worker-assignment that **minimises headcount** while respecting
+    weekly-hour windows and minimum-rest constraints.
 
-    Algorithm:
-      1. Flatten Phase-1 shifts into individual instances.
-      2. Sort instances chronologically (earliest start first).
-      3. For each instance, try to assign it to the existing worker
-         with the *fewest remaining capacity* (best-fit) who satisfies
-         all constraints.  If no worker qualifies, create a new worker.
-      4. After all shifts assigned, report any worker under minimum hours.
+    Strategy (two-tier priority):
+      • Tier 1 – workers still BELOW min weekly hours: prefer the one
+        closest to reaching the minimum (most filled → fewest hours to go).
+      • Tier 2 – workers already AT or ABOVE min weekly hours: prefer the
+        one with the *most* remaining capacity (spread load, leave room
+        for future shifts to avoid creating new workers).
+      • Only create a new worker when no existing worker can accept the
+        shift without violating rest / overlap / max-hours rules.
     """
     t0 = time.time()
 
@@ -321,26 +323,44 @@ def solve_phase2(
     if callback:
         callback(f"Phase 2 (greedy): assigning {n_instances} shift instances")
 
-    # worker state: list of (shift-list, total-intervals)
+    # worker state
     workers: List[List[CandidateShift]] = []
     worker_totals: List[int] = []          # running duration-interval totals
 
     max_ivl = int(params.max_weekly_hours * INTERVALS_PER_HOUR)
+    min_ivl = int(params.min_weekly_hours * INTERVALS_PER_HOUR)
 
     for j, shift in enumerate(instances):
         best_w = -1
-        best_remaining = max_ivl + 1  # lower remaining → tighter fit
+        best_score = None   # (tier, secondary) – lower is better
 
         for w_idx, (w_shifts, w_total) in enumerate(
                 zip(workers, worker_totals)):
-            remaining = max_ivl - w_total - shift.duration_intervals
-            if remaining < 0:
+            new_total = w_total + shift.duration_intervals
+            if new_total > max_ivl:
                 continue  # would exceed max hours
-            if remaining >= best_remaining:
-                continue  # not a tighter fit
-            if _can_assign(w_shifts, shift, params):
+
+            if not _can_assign(w_shifts, shift, params):
+                continue
+
+            if w_total < min_ivl:
+                # Tier 1: worker still below minimum hours.
+                # Prefer the one CLOSEST to minimum (highest total so far)
+                # so they reach min sooner → fewer under-filled workers.
+                tier = 0
+                secondary = -w_total          # more negative = higher total = better
+            else:
+                # Tier 2: worker already at/above minimum.
+                # Prefer the one with the MOST remaining capacity (largest
+                # remaining) to keep room open and delay creating new workers.
+                remaining = max_ivl - new_total
+                tier = 1
+                secondary = -remaining        # more negative = more remaining = better
+
+            score = (tier, secondary)
+            if best_score is None or score < best_score:
                 best_w = w_idx
-                best_remaining = remaining
+                best_score = score
 
         if best_w >= 0:
             workers[best_w].append(shift)
