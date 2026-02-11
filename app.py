@@ -1,540 +1,523 @@
 """
-ShiftCover – Streamlit UI
-=========================
-Upload a weekly demand curve (2 016 × 5-min intervals) and let OR-Tools
-find optimal shift assignments that cover every interval.
-
-Launch:  streamlit run app.py
+ShiftCover – Streamlit front-end
+================================
+Supports 1-3 occupation workload curves with shared shift structures.
 """
 
 import io
-import textwrap
-
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from solver import (
-    TOTAL_INTERVALS, INTERVALS_PER_DAY, INTERVALS_PER_HOUR, DAY_NAMES,
-    SolverParams, solve, shifts_to_dataframe, schedules_to_dataframe,
-    coverage_dataframe, shift_type_summary, build_weekly_report_xlsx,
+    INTERVALS_PER_DAY, INTERVALS_PER_HOUR, TOTAL_INTERVALS,
+    DAY_NAMES, OCC_COLORS,
+    SolverParams, MultiCurveResult,
+    solve_multi,
+    coverage_dataframe, shifts_to_dataframe, schedules_to_dataframe,
+    shift_type_summary, build_weekly_report_xlsx,
 )
-from sample_data import generate_sample_demand, demand_to_dataframe
+from sample_data import generate_sample_demand
 
 # ── Page config ──────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="ShiftCover – Weekly Shift Optimiser",
-    page_icon="📊",
-    layout="wide",
-)
+st.set_page_config(page_title="ShiftCover", layout="wide")
+st.title("🕐 ShiftCover – Weekly Shift Optimiser")
 
-st.title("📊 ShiftCover – Weekly Shift Optimiser")
-st.markdown(
-    "Upload a **weekly demand curve** (2 016 five-minute intervals, 288 per "
-    "day, Monday → Sunday) and the solver will find the optimal shifts "
-    "(3–12 h) to cover every interval while respecting weekly-hour targets."
-)
-
-# ── Sidebar – parameters ────────────────────────────────────────────────────
+# ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("⚙️ Solver Parameters")
+    st.header("Parameters")
 
-    st.subheader("Shift Settings")
-    col1, col2 = st.columns(2)
-    min_shift = col1.number_input("Min shift (h)", 1.0, 12.0, 3.0, 0.5)
-    max_shift = col2.number_input("Max shift (h)", 1.0, 16.0, 12.0, 0.5)
-    max_unique = st.number_input(
-        "Max unique shift types (0 = unlimited)", 0, 200, 0, 1,
-        help="Limit distinct shift patterns to produce a blockier, "
-             "smoother coverage curve with fewer entry/exit events",
-    )
+    n_curves = st.number_input("Number of occupation curves", 1, 3, 1)
+    occ_names = []
+    for i in range(n_curves):
+        default_name = ["Technician", "Labourer", "Helper"][i]
+        name = st.text_input(f"Occupation {i+1} name",
+                             value=default_name, key=f"occ_name_{i}")
+        occ_names.append(name)
 
-    st.subheader("Start-Time / Duration Granularity")
-    start_gran = st.selectbox(
-        "Shift start-time step (min)",
-        [5, 10, 15, 30, 60],
-        index=2,
-        help="Smaller = more candidate shifts = slower but finer grained",
-    )
-    dur_step = st.selectbox(
-        "Duration step (min)", [15, 30, 60], index=1
-    )
+    st.subheader("Shift settings")
+    min_shift = st.slider("Min shift (h)", 3.0, 8.0, 3.0, 0.5)
+    max_shift = st.slider("Max shift (h)", 6.0, 12.0, 12.0, 0.5)
+    max_unique = st.number_input("Max unique shifts (0 = unlimited)", 0, 200, 0)
 
-    st.subheader("Weekly Hours per Worker")
-    col3, col4 = st.columns(2)
-    min_weekly = col3.number_input("Min weekly (h)", 0.0, 80.0, 40.0, 1.0)
-    max_weekly = col4.number_input("Max weekly (h)", 0.0, 80.0, 50.0, 1.0)
+    st.subheader("Granularity")
+    start_step = st.selectbox("Shift-start step (min)",
+                              [5, 10, 15, 30, 60], index=2)
+    dur_step = st.selectbox("Duration step (min)", [15, 30, 60], index=1)
 
-    st.subheader("Worker Constraints")
-    min_rest = st.number_input(
-        "Min rest between shifts (h)", 0.0, 24.0, 12.0, 1.0,
-        help="Legal minimum rest period between consecutive shifts",
-    )
+    st.subheader("Weekly hours")
+    min_wh = st.number_input("Min weekly hours", 20.0, 60.0, 40.0, 1.0)
+    max_wh = st.number_input("Max weekly hours", 20.0, 60.0, 50.0, 1.0)
+
+    st.subheader("Worker constraints")
+    min_rest = st.number_input("Min rest between shifts (h)", 8.0, 24.0, 12.0, 1.0)
 
     st.subheader("Solver")
-    time_limit = st.slider("Time limit per phase (s)", 10, 600, 120, 10)
-    transition_pen = st.slider(
-        "Transition penalty", 0, 500, 50, 10,
-        help="Higher = fewer entry/exit events = blockier coverage. "
-             "0 = no penalty (jagged but cheapest labour cost)",
-    )
+    time_limit = st.number_input("Time limit (s)", 10, 600, 120, 10)
+    t_penalty = st.number_input("Transition penalty", 0, 500, 50, 10)
 
-    st.divider()
-    run_phase2 = st.checkbox("Run Phase 2 (worker assignment)", value=True,
-                              help="Bin-pack shifts into individual workers")
+params = SolverParams(
+    min_shift_hours=min_shift,
+    max_shift_hours=max_shift,
+    shift_start_granularity_min=start_step,
+    shift_duration_step_min=dur_step,
+    min_weekly_hours=min_wh,
+    max_weekly_hours=max_wh,
+    min_rest_hours=min_rest,
+    max_unique_shifts=max_unique,
+    transition_penalty=t_penalty,
+    solver_time_limit_sec=time_limit,
+)
 
-# ── Demand upload / sample ───────────────────────────────────────────────────
-st.header("1 – Demand Curve")
 
-tab_upload, tab_sample = st.tabs(["📁 Upload file", "🎲 Use sample data"])
+# ── Helper: parse uploaded demand file ───────────────────────────────────────
+def _parse_demand_file(uploaded, required_len=TOTAL_INTERVALS):
+    """Return np.ndarray of shape (required_len,) from an uploaded CSV/XLSX."""
+    name = uploaded.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(uploaded)
+    else:
+        df = pd.read_excel(uploaded)
 
-# Persist demand across reruns
-if "demand" not in st.session_state:
-    st.session_state["demand"] = None
+    # Find the numeric demand column
+    for col in ("Required", "required", "Demand", "demand"):
+        if col in df.columns:
+            arr = df[col].values
+            break
+    else:
+        # pick first numeric column
+        num_cols = df.select_dtypes(include="number").columns
+        if len(num_cols) == 0:
+            raise ValueError("No numeric column found")
+        arr = df[num_cols[0]].values
+
+    if len(arr) < required_len:
+        raise ValueError(f"Need {required_len} rows, got {len(arr)}")
+    return np.round(arr[:required_len]).astype(int)
+
+
+# ── Demand input ─────────────────────────────────────────────────────────────
+st.header("📂 Demand input")
+
+tab_upload, tab_sample = st.tabs(["⬆ Upload files", "🎲 Generate sample"])
 
 with tab_upload:
-    st.markdown(textwrap.dedent("""\
-        Upload a **CSV** or **Excel** file.  The file must contain a column
-        of **2 016 integer values** representing the number of personnel
-        required per 5-minute interval across the whole week
-        (Mon 00:00 → Sun 23:55).
+    st.info(f"Upload **{n_curves} file(s)** — one per occupation. "
+            "Each must have {TOTAL_INTERVALS} rows with a numeric column "
+            "(e.g. 'Required').")
+    uploaded_files = []
+    for i in range(n_curves):
+        f = st.file_uploader(
+            f"{occ_names[i]} demand (CSV / XLSX)",
+            type=["csv", "xlsx"],
+            key=f"upload_{i}",
+        )
+        uploaded_files.append(f)
 
-        Accepted column names: `Required`, `Demand`, `Headcount`, `Agents`,
-        or simply the **first numeric column** will be used.
-    """))
-    uploaded = st.file_uploader(
-        "Choose CSV or XLSX", type=["csv", "xlsx", "xls"]
-    )
-    if uploaded is not None:
+    if st.button("Load uploaded files", key="btn_load"):
         try:
-            if uploaded.name.endswith(".csv"):
-                df_up = pd.read_csv(uploaded)
-            else:
-                df_up = pd.read_excel(uploaded)
-
-            # find the demand column
-            target_names = {"required", "demand", "headcount", "agents"}
-            demand_col = None
-            for c in df_up.columns:
-                if c.strip().lower() in target_names:
-                    demand_col = c
-                    break
-            if demand_col is None:
-                # fall back to first numeric column
-                for c in df_up.columns:
-                    if pd.api.types.is_numeric_dtype(df_up[c]):
-                        demand_col = c
-                        break
-
-            if demand_col is None:
-                st.error("❌ No numeric column found in the uploaded file.")
-            else:
-                vals = df_up[demand_col].dropna().values
-                if len(vals) < TOTAL_INTERVALS:
-                    st.error(
-                        f"❌ Need {TOTAL_INTERVALS} rows, got {len(vals)}."
-                    )
-                else:
-                    st.session_state["demand"] = np.round(vals[:TOTAL_INTERVALS]).astype(int)
-                    d_arr = st.session_state["demand"]
-                    st.success(
-                        f"✅ Loaded **{demand_col}** column — "
-                        f"min {d_arr.min()}, max {d_arr.max()}, "
-                        f"mean {d_arr.mean():.1f}"
-                    )
+            demands = []
+            for i, f in enumerate(uploaded_files):
+                if f is None:
+                    st.error(f"Missing file for {occ_names[i]}")
+                    st.stop()
+                demands.append(_parse_demand_file(f))
+            st.session_state["demands"] = demands
+            st.session_state["occ_names"] = occ_names[:]
+            st.success(f"Loaded {len(demands)} curve(s)")
         except Exception as exc:
-            st.error(f"❌ Error reading file: {exc}")
+            st.error(str(exc))
 
 with tab_sample:
-    st.markdown("Generate a synthetic demand curve for testing.")
-    scol1, scol2 = st.columns(2)
-    peak = scol1.slider("Peak agents", 5, 100, 25)
-    base = scol2.slider("Base agents", 0, 20, 2)
-    if st.button("Generate sample"):
-        st.session_state["demand"] = generate_sample_demand(
-            peak_agents=peak, base_agents=base
-        )
-        st.success("✅ Sample demand generated")
+    cols_sample = st.columns(n_curves)
+    peaks = []
+    bases = []
+    for i, col in enumerate(cols_sample):
+        with col:
+            st.markdown(f"**{occ_names[i]}**")
+            pk = st.slider(f"Peak agents", 5, 60, max(5, 25 - i * 8),
+                           key=f"peak_{i}")
+            bs = st.slider(f"Base agents", 0, 10, max(1, 3 - i),
+                           key=f"base_{i}")
+            peaks.append(pk)
+            bases.append(bs)
+    sample_seed = st.number_input("Random seed", 0, 9999, 42)
 
-# ── Show demand chart ────────────────────────────────────────────────────────
-demand = st.session_state["demand"]
-if demand is not None:
-    with st.expander("📈 Preview demand curve", expanded=True):
-        x_labels = []
-        for t in range(TOTAL_INTERVALS):
-            day = t // INTERVALS_PER_DAY
-            intra = t % INTERVALS_PER_DAY
-            h, m_ = divmod(intra * 5, 60)
-            x_labels.append(f"{DAY_NAMES[day][:3]} {h:02d}:{m_:02d}")
+    if st.button("🎲 Generate sample", key="btn_sample"):
+        demands = []
+        for i in range(n_curves):
+            d = generate_sample_demand(
+                peak_agents=peaks[i],
+                base_agents=bases[i],
+                seed=sample_seed + i * 7,
+            )
+            demands.append(d)
+        st.session_state["demands"] = demands
+        st.session_state["occ_names"] = occ_names[:]
+        st.success(f"Generated {n_curves} sample curve(s)")
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=list(range(TOTAL_INTERVALS)), y=demand,
-            mode="lines", name="Required",
-            line=dict(color="#1f77b4"),
-            hovertext=x_labels,
+# ── Preview demand chart ─────────────────────────────────────────────────────
+demands = st.session_state.get("demands")
+stored_names = st.session_state.get("occ_names", occ_names)
+
+if demands is not None:
+    # ensure curve count matches current n_curves
+    if len(demands) != n_curves:
+        st.warning("Number of curves changed — please regenerate / re-upload.")
+        demands = None
+
+if demands is not None:
+    st.subheader("Demand preview")
+    x_vals = list(range(TOTAL_INTERVALS))
+    fig_d = go.Figure()
+    for i, (d, name) in enumerate(zip(demands, stored_names)):
+        color = OCC_COLORS[i % len(OCC_COLORS)]
+        fig_d.add_trace(go.Scatter(
+            x=x_vals, y=d, mode="lines", name=name,
+            fill="tozeroy",
+            line=dict(color=color, width=1),
+            opacity=0.55,
         ))
-        # day separators
-        for d in range(1, 7):
-            fig.add_vline(x=d * INTERVALS_PER_DAY, line_dash="dot",
-                          line_color="grey", opacity=0.5)
-        fig.update_layout(
-            height=300, margin=dict(l=40, r=20, t=30, b=40),
-            xaxis=dict(
-                tickvals=[d * INTERVALS_PER_DAY + 144 for d in range(7)],
-                ticktext=[DAY_NAMES[d][:3] for d in range(7)],
-            ),
-            yaxis_title="Agents required",
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    # add total if >1 curve
+    if len(demands) > 1:
+        total_d = sum(demands)
+        fig_d.add_trace(go.Scatter(
+            x=x_vals, y=total_d, mode="lines", name="Total",
+            line=dict(color="black", width=2, dash="dot"),
+        ))
+    # day separators
+    for d in range(1, 7):
+        fig_d.add_vline(x=d * INTERVALS_PER_DAY, line_dash="dash",
+                        line_color="grey", opacity=0.4)
+    tick_vals = [d * INTERVALS_PER_DAY for d in range(7)]
+    fig_d.update_xaxes(tickvals=tick_vals, ticktext=DAY_NAMES)
+    fig_d.update_layout(height=300, margin=dict(l=40, r=20, t=30, b=30),
+                        legend=dict(orientation="h", y=1.12))
+    st.plotly_chart(fig_d, use_container_width=True)
 
-    # ── Download template ────────────────────────────────────────────────
-    with st.expander("⬇️ Download this demand as CSV"):
-        csv_buf = demand_to_dataframe(demand).to_csv(index=False)
-        st.download_button(
-            "Download CSV",
-            csv_buf,
-            file_name="demand_curve.csv",
-            mime="text/csv",
-        )
 
 # ── Solve ────────────────────────────────────────────────────────────────────
-st.header("2 – Optimise")
+if demands is not None:
+    if st.button("▶ Run Optimiser", type="primary"):
+        log_box = st.empty()
+        log_lines: list[str] = []
 
-if demand is None:
-    st.info("⬆️ Upload or generate a demand curve first.")
-    st.stop()
+        def _cb(msg):
+            log_lines.append(msg)
+            log_box.code("\n".join(log_lines), language="text")
 
-if st.button("🚀 Run Optimiser", type="primary"):
-    params = SolverParams(
-        min_shift_hours=min_shift,
-        max_shift_hours=max_shift,
-        shift_start_granularity_min=start_gran,
-        shift_duration_step_min=dur_step,
-        min_weekly_hours=min_weekly,
-        max_weekly_hours=max_weekly,
-        min_rest_hours=min_rest,
-        max_unique_shifts=max_unique,
-        transition_penalty=transition_pen,
-        solver_time_limit_sec=time_limit,
-    )
+        with st.spinner("Solving …"):
+            result = solve_multi(demands, stored_names, params, callback=_cb)
 
-    log_area = st.empty()
-    log_lines: list[str] = []
+        st.session_state["result"] = result
+        st.session_state["result_params"] = params
 
-    def log_cb(msg: str):
-        log_lines.append(msg)
-        log_area.code("\n".join(log_lines), language="text")
-
-    with st.spinner("Running OR-Tools CP-SAT solver …"):
-        result = solve(demand, params, callback=log_cb)
-
-    st.session_state["result"] = result
-    st.session_state["params"] = params
 
 # ── Results ──────────────────────────────────────────────────────────────────
-if "result" not in st.session_state:
-    st.stop()
+result: MultiCurveResult | None = st.session_state.get("result")
 
-result = st.session_state["result"]
-params = st.session_state["params"]
+if result is not None:
+    st.divider()
+    st.header("📊 Results")
 
-st.header("3 – Results")
+    cp1 = result.combined_phase1
+    n_occ = len(result.occupations)
 
-# ---- Phase 1 summary ----
-p1 = result.phase1
-st.subheader("Phase 1 – Set Covering")
+    # ── Phase 1 summary metrics ──────────────────────────────────────────
+    st.subheader("Phase 1 – Set Covering")
+    total_headcount = sum(o.phase2.num_workers for o in result.occupations)
+    peak_sim = int(cp1.coverage.max())
+    total_wh = cp1.total_worker_intervals / INTERVALS_PER_HOUR
+    n_active = sum(1 for c in cp1.counts if c > 0)
 
-mcol1, mcol2, mcol3, mcol4, mcol5, mcol6, mcol7 = st.columns(7)
-mcol1.metric("Status", p1.status)
-mcol2.metric("Active shifts",
-             sum(1 for c in p1.counts if c > 0) if p1.counts else 0)
-total_wh = p1.total_worker_intervals / INTERVALS_PER_HOUR if p1.counts else 0
-mcol3.metric("Total worker-hours", f"{total_wh:,.0f}")
-# Headcount = total unique workers from Phase 2
-p2_preview = result.phase2
-headcount = p2_preview.num_workers if p2_preview.num_workers else "–"
-mcol4.metric("Headcount", headcount)
-# Peak simultaneous workers needed (max coverage value)
-peak_headcount = int(p1.coverage.max()) if p1.counts else 0
-mcol5.metric("Peak Simultaneous", peak_headcount)
-# FTE = total worker-hours / 45
-fte = total_wh / 45.0
-mcol6.metric("FTE (÷45 h)", f"{fte:.1f}")
-mcol7.metric("Solve time", f"{p1.elapsed_sec:.1f} s")
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    c1.metric("Status", cp1.status)
+    c2.metric("Active shifts", n_active)
+    c3.metric("Total worker-h", f"{total_wh:,.0f}")
+    c4.metric("Headcount", total_headcount)
+    c5.metric("Peak Simultaneous", peak_sim)
+    c6.metric("FTE (÷45)", f"{total_wh / 45:.1f}")
+    c7.metric("Solve time", f"{cp1.elapsed_sec:.1f}s")
 
-if p1.status not in ("OPTIMAL", "FEASIBLE"):
-    st.error(f"Solver returned **{p1.status}** – try relaxing constraints.")
-    st.stop()
+    # per-occupation headcount
+    if n_occ > 1:
+        occ_cols = st.columns(n_occ)
+        for i, occ in enumerate(result.occupations):
+            with occ_cols[i]:
+                occ_wh = occ.phase1.total_worker_intervals / INTERVALS_PER_HOUR
+                st.metric(f"{occ.name} headcount", occ.phase2.num_workers)
+                st.metric(f"{occ.name} worker-h", f"{occ_wh:,.0f}")
 
-# ---- Coverage chart (weekly overview – filled area) ----
-cov_df = coverage_dataframe(result)
-with st.expander("📈 Demand vs. Coverage – Full Week", expanded=True):
-    fig2 = go.Figure()
-    # Coverage filled area (drawn first so demand line sits on top)
-    fig2.add_trace(go.Scatter(
-        x=cov_df["Interval"], y=cov_df["Coverage"],
-        mode="lines", name="Coverage",
-        line=dict(color="#2ca02c", width=1),
-        fill="tozeroy",
-        fillcolor="rgba(44,160,44,0.25)",
+    # ── Weekly coverage chart (combined + sub-curves) ────────────────────
+    st.subheader("Weekly coverage")
+    x_vals = list(range(TOTAL_INTERVALS))
+    fig_w = go.Figure()
+
+    # total demand + coverage (thick lines)
+    fig_w.add_trace(go.Scatter(
+        x=x_vals, y=result.combined_demand, mode="lines",
+        name="Total demand",
+        line=dict(color="red", width=2),
+        fill="tozeroy", fillcolor="rgba(255,0,0,0.08)",
     ))
-    # Demand filled area
-    fig2.add_trace(go.Scatter(
-        x=cov_df["Interval"], y=cov_df["Demand"],
-        mode="lines", name="Demand",
-        line=dict(color="#1f77b4", width=2),
-        fill="tozeroy",
-        fillcolor="rgba(31,119,180,0.18)",
+    fig_w.add_trace(go.Scatter(
+        x=x_vals, y=cp1.coverage, mode="lines",
+        name="Total coverage",
+        line=dict(color="green", width=2),
+        fill="tozeroy", fillcolor="rgba(0,128,0,0.08)",
     ))
+
+    # per-occupation sub-curves (thin, dashed)
+    if n_occ > 1:
+        for i, occ in enumerate(result.occupations):
+            clr = OCC_COLORS[i % len(OCC_COLORS)]
+            fig_w.add_trace(go.Scatter(
+                x=x_vals, y=occ.demand, mode="lines",
+                name=f"{occ.name} demand",
+                line=dict(color=clr, width=1, dash="dash"),
+                visible="legendonly",
+            ))
+            fig_w.add_trace(go.Scatter(
+                x=x_vals, y=occ.phase1.coverage, mode="lines",
+                name=f"{occ.name} coverage",
+                line=dict(color=clr, width=1),
+                visible="legendonly",
+            ))
+
     for d in range(1, 7):
-        fig2.add_vline(x=d * INTERVALS_PER_DAY, line_dash="dot",
-                       line_color="grey", opacity=0.4)
-    fig2.update_layout(
-        height=350, margin=dict(l=40, r=20, t=30, b=40),
-        xaxis=dict(
-            tickvals=[d * INTERVALS_PER_DAY + 144 for d in range(7)],
-            ticktext=[DAY_NAMES[d][:3] for d in range(7)],
-        ),
-        yaxis_title="Agents",
-        legend=dict(orientation="h", y=1.12),
-    )
-    st.plotly_chart(fig2, use_container_width=True)
+        fig_w.add_vline(x=d * INTERVALS_PER_DAY, line_dash="dash",
+                        line_color="grey", opacity=0.4)
+    tick_vals = [d * INTERVALS_PER_DAY for d in range(7)]
+    fig_w.update_xaxes(tickvals=tick_vals, ticktext=DAY_NAMES)
+    fig_w.update_layout(height=400, margin=dict(l=40, r=20, t=30, b=30),
+                        legend=dict(orientation="h", y=1.15))
+    st.plotly_chart(fig_w, use_container_width=True)
 
-    # over / under coverage
-    over = (cov_df["Coverage"] - cov_df["Demand"]).clip(lower=0).sum()
-    under = (cov_df["Demand"] - cov_df["Coverage"]).clip(lower=0).sum()
-    st.markdown(
-        f"**Over-coverage:** {over:,} interval-slots &nbsp;|&nbsp; "
-        f"**Under-coverage:** {under:,} interval-slots"
-    )
+    # ── Daily coverage chart (dropdown) ──────────────────────────────────
+    st.subheader("Daily coverage")
+    sel_day = st.selectbox("Day", DAY_NAMES, key="sel_day")
+    day_idx = DAY_NAMES.index(sel_day)
+    day_start = day_idx * INTERVALS_PER_DAY
+    day_end = day_start + INTERVALS_PER_DAY
+    day_x = list(range(INTERVALS_PER_DAY))
 
-# ---- Per-day coverage chart (dropdown selector) ----
-with st.expander("📅 Daily Demand vs. Coverage", expanded=True):
-    # build time labels for a single day (00:00 – 23:55)
-    day_time_labels = []
-    for i in range(INTERVALS_PER_DAY):
-        h, m_ = divmod(i * 5, 60)
-        day_time_labels.append(f"{h:02d}:{m_:02d}")
-
-    selected_day_name = st.selectbox(
-        "Select day", DAY_NAMES, index=0, key="day_selector"
-    )
-    day = DAY_NAMES.index(selected_day_name)
-
-    start_t = day * INTERVALS_PER_DAY
-    end_t = start_t + INTERVALS_PER_DAY
-    day_demand = cov_df["Demand"].values[start_t:end_t]
-    day_coverage = cov_df["Coverage"].values[start_t:end_t]
-
-    # daily metrics row
-    day_peak_hc = int(day_coverage.max())
-    day_total_hrs = float(day_coverage.sum()) / INTERVALS_PER_HOUR
-    day_demand_hrs = float(day_demand.sum()) / INTERVALS_PER_HOUR
-    day_over = int(np.clip(day_coverage - day_demand, 0, None).sum())
-    day_under = int(np.clip(day_demand - day_coverage, 0, None).sum())
-
-    dc1, dc2, dc3, dc4, dc5 = st.columns(5)
-    dc1.metric("Peak Headcount", day_peak_hc)
-    dc2.metric("Coverage hrs", f"{day_total_hrs:.0f}")
-    dc3.metric("Demand hrs", f"{day_demand_hrs:.0f}")
-    dc4.metric("Over-coverage", f"{day_over:,} slots")
-    dc5.metric("Under-coverage", f"{day_under:,} slots")
+    # per-occupation day metrics
+    if n_occ > 1:
+        day_met_cols = st.columns(n_occ + 1)
+        for i, occ in enumerate(result.occupations):
+            sl = slice(day_start, day_end)
+            with day_met_cols[i]:
+                d_dem = occ.demand[sl]
+                d_cov = occ.phase1.coverage[sl]
+                st.metric(f"{occ.name} peak demand", int(d_dem.max()))
+                st.metric(f"{occ.name} peak coverage", int(d_cov.max()))
+        with day_met_cols[-1]:
+            td = result.combined_demand[day_start:day_end]
+            tc = cp1.coverage[day_start:day_end]
+            st.metric("Total peak demand", int(td.max()))
+            st.metric("Total peak coverage", int(tc.max()))
+    else:
+        occ = result.occupations[0]
+        sl = slice(day_start, day_end)
+        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+        d_dem = occ.demand[sl]
+        d_cov = occ.phase1.coverage[sl]
+        mc1.metric("Peak demand", int(d_dem.max()))
+        mc2.metric("Peak coverage", int(d_cov.max()))
+        mc3.metric("Avg demand", f"{d_dem.mean():.1f}")
+        mc4.metric("Avg coverage", f"{d_cov.mean():.1f}")
+        surplus = d_cov.astype(int) - d_dem.astype(int)
+        mc5.metric("Max surplus", int(surplus.max()))
 
     fig_day = go.Figure()
+    # total
+    td = result.combined_demand[day_start:day_end]
+    tc = cp1.coverage[day_start:day_end]
     fig_day.add_trace(go.Scatter(
-        x=list(range(INTERVALS_PER_DAY)),
-        y=day_coverage,
-        mode="lines", name="Coverage",
-        line=dict(color="#2ca02c", width=1.5),
-        fill="tozeroy",
-        fillcolor="rgba(44,160,44,0.25)",
-        hovertext=day_time_labels,
+        x=day_x, y=td, mode="lines", name="Total demand",
+        line=dict(color="red", width=2),
+        fill="tozeroy", fillcolor="rgba(255,0,0,0.08)",
     ))
     fig_day.add_trace(go.Scatter(
-        x=list(range(INTERVALS_PER_DAY)),
-        y=day_demand,
-        mode="lines", name="Demand",
-        line=dict(color="#1f77b4", width=2),
-        fill="tozeroy",
-        fillcolor="rgba(31,119,180,0.18)",
-        hovertext=day_time_labels,
+        x=day_x, y=tc, mode="lines", name="Total coverage",
+        line=dict(color="green", width=2),
+        fill="tozeroy", fillcolor="rgba(0,128,0,0.08)",
     ))
-    fig_day.update_layout(
-        title=dict(
-            text=f"{selected_day_name}",
-            font=dict(size=16),
-        ),
-        height=420,
-        margin=dict(l=50, r=20, t=45, b=50),
-        xaxis=dict(
-            tickvals=list(range(0, INTERVALS_PER_DAY, 12)),  # every hour
-            ticktext=[day_time_labels[i]
-                      for i in range(0, INTERVALS_PER_DAY, 12)],
-            tickangle=-45,
-            title="Time of day",
-        ),
-        yaxis_title="Agents",
-        legend=dict(orientation="h", y=1.10),
-    )
+    if n_occ > 1:
+        for i, occ in enumerate(result.occupations):
+            clr = OCC_COLORS[i % len(OCC_COLORS)]
+            fig_day.add_trace(go.Scatter(
+                x=day_x, y=occ.demand[day_start:day_end],
+                mode="lines", name=f"{occ.name} demand",
+                line=dict(color=clr, width=1, dash="dash"),
+            ))
+            fig_day.add_trace(go.Scatter(
+                x=day_x, y=occ.phase1.coverage[day_start:day_end],
+                mode="lines", name=f"{occ.name} coverage",
+                line=dict(color=clr, width=1),
+                fill="tozeroy", fillcolor=f"rgba({int(clr[1:3],16)},{int(clr[3:5],16)},{int(clr[5:7],16)},0.10)",
+            ))
+
+    hourly_ticks = list(range(0, INTERVALS_PER_DAY, INTERVALS_PER_HOUR))
+    hourly_labels = [f"{h:02d}:00" for h in range(24)]
+    fig_day.update_xaxes(tickvals=hourly_ticks, ticktext=hourly_labels,
+                         tickangle=45)
+    fig_day.update_layout(height=400, margin=dict(l=40, r=20, t=30, b=50),
+                          legend=dict(orientation="h", y=1.12))
     st.plotly_chart(fig_day, use_container_width=True)
 
-# ---- Shift table ----
-with st.expander("📋 Active Shifts (Phase 1)"):
-    shift_df = shifts_to_dataframe(p1)
-    st.dataframe(shift_df, use_container_width=True, hide_index=True)
-    csv1 = shift_df.to_csv(index=False)
-    st.download_button("Download shifts CSV", csv1,
-                       file_name="shifts.csv", mime="text/csv")
-
-# ---- Phase 2 ----
-p2 = result.phase2
-if p2.status == "SKIPPED":
-    st.info("Phase 2 was skipped.")
-elif p2.status == "NO_SHIFTS":
-    st.warning("No shift instances to assign.")
-else:
+    # ── Phase 2 summary ─────────────────────────────────────────────────
     st.subheader("Phase 2 – Worker Assignment")
-    wcol1, wcol2, wcol3, wcol4, wcol5 = st.columns(5)
-    wcol1.metric("Headcount (workers)", p2.num_workers)
-    avg_wh = np.mean(p2.worker_hours) if p2.worker_hours else 0
-    wcol2.metric(
-        "Avg weekly hours",
-        f"{avg_wh:.1f}" if p2.worker_hours else "–"
-    )
-    total_assigned_hrs = sum(p2.worker_hours) if p2.worker_hours else 0
-    fte_p2 = total_assigned_hrs / 45.0
-    wcol3.metric("FTE (÷45 h)", f"{fte_p2:.1f}")
-    wcol4.metric("Total assigned hours", f"{total_assigned_hrs:,.0f}")
-    wcol5.metric("Solve time", f"{p2.elapsed_sec:.1f} s")
 
-    if "BELOW" in p2.status.upper() or "below" in p2.status:
-        st.warning(f"⚠️ {p2.status}")
+    for occ in result.occupations:
+        p2 = occ.phase2
+        if n_occ > 1:
+            st.markdown(f"**{occ.name}**")
+        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+        mc1.metric("Headcount", p2.num_workers)
+        avg_h = (sum(p2.worker_hours) / max(1, p2.num_workers))
+        mc2.metric("Avg weekly hours", f"{avg_h:.1f}")
+        mc3.metric("FTE (÷45)", f"{sum(p2.worker_hours)/45:.1f}")
+        mc4.metric("Total assigned h",
+                    f"{sum(p2.worker_hours):,.0f}")
+        mc5.metric("Solve time", f"{p2.elapsed_sec:.1f}s")
 
-    sched_df = schedules_to_dataframe(p2)
+    # ── Gantt chart (per occupation) ─────────────────────────────────────
+    st.subheader("Gantt chart")
+    if n_occ > 1:
+        gantt_occ = st.selectbox("Occupation",
+                                 [o.name for o in result.occupations],
+                                 key="gantt_occ")
+        sel_occ = next(o for o in result.occupations
+                       if o.name == gantt_occ)
+    else:
+        sel_occ = result.occupations[0]
 
-    # ---- Gantt-style chart ----
-    with st.expander("📅 Worker Schedule (Gantt view)", expanded=True):
-        fig3 = go.Figure()
-        colors = [
-            "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-            "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
-        ]
-        for _, row in sched_df.iterrows():
-            w = int(row["Worker"])
-            d = int(row["DayNum"])
-            sh, sm = map(int, row["Start"].split(":"))
-            eh, em = map(int, row["End"].split(":"))
-            start_h = d * 24 + sh + sm / 60
-            end_h = d * 24 + eh + em / 60
-            fig3.add_trace(go.Bar(
-                x=[end_h - start_h],
-                y=[f"EMP-{w:03d}"],
-                base=start_h,
-                orientation="h",
-                marker_color=colors[d % len(colors)],
-                name=DAY_NAMES[d],
-                showlegend=False,
-                hovertemplate=(
-                    f"EMP-{w:03d}<br>{DAY_NAMES[d]} "
-                    f"{row['Start']}–{row['End']} "
-                    f"({row['DurationHrs']:.1f} h)<extra></extra>"
-                ),
+    p2 = sel_occ.phase2
+    prefix = sel_occ.name[:3].upper()
+    if p2.worker_schedules:
+        gantt_rows = []
+        for w_idx, sched in enumerate(p2.worker_schedules):
+            emp_id = f"{prefix}-{w_idx+1:03d}"
+            for s in sched:
+                gantt_rows.append({
+                    "Worker": emp_id,
+                    "Day": DAY_NAMES[s.day],
+                    "Start": s.global_start,
+                    "End": s.global_end,
+                    "Shift": s.shift_code,
+                })
+        gdf = pd.DataFrame(gantt_rows)
+        day_color = {d: c for d, c in zip(
+            DAY_NAMES,
+            ["#636EFA", "#EF553B", "#00CC96", "#AB63FA",
+             "#FFA15A", "#19D3F3", "#FF6692"])}
+        fig_g = go.Figure()
+        for _, row in gdf.iterrows():
+            fig_g.add_trace(go.Bar(
+                y=[row["Worker"]], x=[row["End"] - row["Start"]],
+                base=row["Start"], orientation="h",
+                marker_color=day_color.get(row["Day"], "#999"),
+                name=row["Day"], showlegend=False,
+                hovertext=f'{row["Day"]} {row["Shift"]}',
+                hoverinfo="text",
             ))
-        fig3.update_layout(
+        tick_vals = [d * INTERVALS_PER_DAY for d in range(7)]
+        fig_g.update_xaxes(tickvals=tick_vals, ticktext=DAY_NAMES)
+        n_w = p2.num_workers
+        fig_g.update_layout(
+            height=max(300, 22 * n_w + 80),
             barmode="stack",
-            height=max(300, p2.num_workers * 28 + 80),
-            margin=dict(l=70, r=20, t=30, b=50),
-            xaxis=dict(
-                title="Hour of week",
-                tickvals=[d * 24 + 12 for d in range(7)],
-                ticktext=[DAY_NAMES[d][:3] for d in range(7)],
-            ),
+            margin=dict(l=80, r=20, t=30, b=30),
             yaxis=dict(autorange="reversed"),
         )
-        for d in range(1, 7):
-            fig3.add_vline(x=d * 24, line_dash="dot",
-                           line_color="grey", opacity=0.4)
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig_g, use_container_width=True)
 
-    # ---- Worker hours histogram ----
-    with st.expander("📊 Weekly hours distribution"):
-        fig4 = go.Figure()
-        fig4.add_trace(go.Histogram(
-            x=p2.worker_hours, nbinsx=20,
-            marker_color="#1f77b4",
-        ))
-        fig4.add_vline(x=params.min_weekly_hours, line_dash="dash",
-                       line_color="red", annotation_text="Min")
-        fig4.add_vline(x=params.max_weekly_hours, line_dash="dash",
-                       line_color="red", annotation_text="Max")
-        fig4.update_layout(
-            height=280,
-            xaxis_title="Weekly hours",
-            yaxis_title="Workers",
-            margin=dict(l=40, r=20, t=30, b=40),
-        )
-        st.plotly_chart(fig4, use_container_width=True)
+    # ── Weekly-hours histogram ───────────────────────────────────────────
+    st.subheader("Weekly hours distribution")
+    all_hrs = []
+    for occ in result.occupations:
+        for h in occ.phase2.worker_hours:
+            all_hrs.append({"Hours": h, "Occupation": occ.name})
+    if all_hrs:
+        hdf = pd.DataFrame(all_hrs)
+        fig_h = go.Figure()
+        for i, occ in enumerate(result.occupations):
+            clr = OCC_COLORS[i % len(OCC_COLORS)]
+            sub = hdf[hdf["Occupation"] == occ.name]["Hours"]
+            fig_h.add_trace(go.Histogram(
+                x=sub, name=occ.name,
+                marker_color=clr, opacity=0.7,
+                nbinsx=20,
+            ))
+        fig_h.add_vline(x=params.min_weekly_hours, line_dash="dash",
+                        line_color="orange",
+                        annotation_text=f"Min {params.min_weekly_hours}h")
+        fig_h.add_vline(x=params.max_weekly_hours, line_dash="dash",
+                        line_color="red",
+                        annotation_text=f"Max {params.max_weekly_hours}h")
+        fig_h.update_layout(
+            height=300, barmode="overlay",
+            margin=dict(l=40, r=20, t=30, b=30))
+        st.plotly_chart(fig_h, use_container_width=True)
 
-    # ---- Shift Type Summary ----
-    with st.expander("📋 Shift Types (HHMM-HHMM)", expanded=True):
-        st_df = shift_type_summary(p1)
-        st.dataframe(st_df, use_container_width=True, hide_index=True)
+    # ── Shift Types ──────────────────────────────────────────────────────
+    st.subheader("Shift types")
+    all_st = []
+    for occ in result.occupations:
+        st_df = shift_type_summary(occ.phase1, occ.name)
+        all_st.append(st_df)
+    if all_st:
+        combined_st = pd.concat(all_st, ignore_index=True)
+        st.dataframe(combined_st, use_container_width=True, hide_index=True)
 
-    # ---- Full Roster table ----
+    # ── Full Roster ──────────────────────────────────────────────────────
     with st.expander("📋 Full Roster"):
-        # build roster with EMP IDs and shift codes
-        roster_rows = []
-        for w_idx, (schedule, hrs) in enumerate(
-                zip(p2.worker_schedules, p2.worker_hours)):
-            for s in schedule:
-                roster_rows.append({
-                    "Worker": f"EMP-{w_idx + 1:03d}",
-                    "Day": DAY_NAMES[s.day],
-                    "Shift": s.shift_code,
-                    "Start": s.start_time_str,
-                    "End": s.end_time_str,
-                    "Hours": s.duration_hours,
-                    "WeeklyHrs": hrs,
-                })
-        roster_df = pd.DataFrame(roster_rows)
-        st.dataframe(roster_df, use_container_width=True, hide_index=True)
+        all_roster = []
+        emp_off = 0
+        for occ in result.occupations:
+            rdf = schedules_to_dataframe(occ.phase2, occ.name, emp_off)
+            prefix = occ.name[:3].upper()
+            if not rdf.empty:
+                rdf["Worker"] = rdf["Worker"].apply(
+                    lambda w: f"{prefix}-{w:03d}")
+            all_roster.append(rdf)
+            emp_off += occ.phase2.num_workers
+        if all_roster:
+            st.dataframe(pd.concat(all_roster, ignore_index=True),
+                         use_container_width=True, hide_index=True)
 
-    # ---- Per-worker summary ----
+    # ── Per-Worker Summary ───────────────────────────────────────────────
     with st.expander("👤 Per-Worker Summary"):
-        summary_rows = []
-        for w_idx, (sched, hrs) in enumerate(
-                zip(p2.worker_schedules, p2.worker_hours)):
-            row = {
-                "Worker": f"EMP-{w_idx + 1:03d}",
-                "Shifts": len(sched),
-                "WeeklyHours": f"{hrs:.1f}",
-                "FTE(÷45)": f"{hrs / 45.0:.2f}",
-            }
-            for d in range(7):
-                day_shifts = [s for s in sched if s.day == d]
-                if day_shifts:
-                    row[DAY_NAMES[d][:3]] = ", ".join(
-                        s.shift_code for s in day_shifts)
-                else:
-                    row[DAY_NAMES[d][:3]] = "OFF"
-            summary_rows.append(row)
-        st.dataframe(pd.DataFrame(summary_rows),
-                     use_container_width=True, hide_index=True)
+        ws_rows = []
+        for occ in result.occupations:
+            prefix = occ.name[:3].upper()
+            for w_idx, (sched, hrs) in enumerate(
+                    zip(occ.phase2.worker_schedules,
+                        occ.phase2.worker_hours)):
+                row = {
+                    "Occupation": occ.name,
+                    "Worker": f"{prefix}-{w_idx+1:03d}",
+                    "TotalHours": round(hrs, 1),
+                    "FTE(÷45)": round(hrs / 45, 2),
+                    "Shifts": len(sched),
+                }
+                for d in range(7):
+                    ds = [s for s in sched if s.day == d]
+                    row[DAY_NAMES[d]] = (
+                        ", ".join(s.shift_code for s in ds) if ds else "OFF")
+                ws_rows.append(row)
+        if ws_rows:
+            st.dataframe(pd.DataFrame(ws_rows),
+                         use_container_width=True, hide_index=True)
 
-    # ---- XLSX Download ----
-    st.subheader("⬇️ Download Weekly Report")
+    # ── XLSX download ────────────────────────────────────────────────────
+    st.subheader("📥 Download report")
     xlsx_bytes = build_weekly_report_xlsx(result)
     st.download_button(
-        "📥 Download XLSX Report",
+        "⬇ Download XLSX report",
         data=xlsx_bytes,
-        file_name="weekly_shift_report.xlsx",
+        file_name="shiftcover_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-# ── Footer ───────────────────────────────────────────────────────────────────
-st.divider()
-st.caption(
-    "ShiftCover © 2026 — Powered by Google OR-Tools CP-SAT & Streamlit"
-)
