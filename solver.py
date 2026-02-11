@@ -62,6 +62,16 @@ class CandidateShift:
             h -= 24
         return f"{h:02d}:{m:02d}"
 
+    @property
+    def shift_code(self) -> str:
+        """Shift type in HHMM-HHMM format."""
+        sh, sm = divmod(self.start_interval * 5, 60)
+        total_end_min = (self.start_interval + self.duration_intervals) * 5
+        eh, em = divmod(total_end_min, 60)
+        if eh >= 24:
+            eh -= 24
+        return f"{sh:02d}{sm:02d}-{eh:02d}{em:02d}"
+
     def covers(self, global_interval: int) -> bool:
         return self.global_start <= global_interval < self.global_end
 
@@ -76,6 +86,7 @@ class SolverParams:
     min_weekly_hours: float = 40.0
     max_weekly_hours: float = 50.0
     max_shifts_per_day_per_worker: int = 1
+    min_rest_hours: float = 12.0               # minimum rest between shifts
     solver_time_limit_sec: int = 120
     # whether to allow overnight shifts within a day (ending after 24:00)
     allow_overnight: bool = False
@@ -233,17 +244,64 @@ def solve_phase1(
                           status_str, elapsed)
 
 
-# ── Phase 2 – Worker Assignment (Bin Packing) ────────────────────────────────
+# ── Phase 2 – Worker Assignment (Greedy with rest constraint) ────────────────
+def _can_assign(worker_shifts: List[CandidateShift],
+               shift: CandidateShift,
+               params: SolverParams) -> bool:
+    """
+    Check whether *shift* can be added to a worker who already has
+    *worker_shifts*.  Rules:
+      1. Worker hasn't exceeded max weekly hours.
+      2. Worker has at most max_shifts_per_day on this day.
+      3. At least min_rest_hours gap between the end of any existing
+         shift and the start of this one (and vice-versa).
+      4. Shifts must not overlap.
+    """
+    rest_intervals = int(params.min_rest_hours * INTERVALS_PER_HOUR)
+    max_intervals = int(params.max_weekly_hours * INTERVALS_PER_HOUR)
+
+    # weekly hours check
+    current_total = sum(s.duration_intervals for s in worker_shifts)
+    if current_total + shift.duration_intervals > max_intervals:
+        return False
+
+    # per-day count
+    day_count = sum(1 for s in worker_shifts if s.day == shift.day)
+    if day_count >= params.max_shifts_per_day_per_worker:
+        return False
+
+    # overlap & rest gap
+    for existing in worker_shifts:
+        # overlap check
+        if not (shift.global_end <= existing.global_start or
+                existing.global_end <= shift.global_start):
+            return False
+        # rest gap: end-of-earlier + rest <= start-of-later
+        if existing.global_end <= shift.global_start:
+            gap = shift.global_start - existing.global_end
+        else:
+            gap = existing.global_start - shift.global_end
+        if gap < rest_intervals:
+            return False
+
+    return True
+
+
 def solve_phase2(
     p1: PhaseOneResult,
     params: SolverParams,
     callback=None,
 ) -> PhaseTwoResult:
     """
-    Assign the shift instances from Phase 1 to individual workers so that
-    each worker's total weekly hours is in [min_weekly, max_weekly] and
-    each worker has at most `max_shifts_per_day_per_worker` shifts per day.
-    Minimise total number of workers.
+    Greedy worker-assignment with minimum-rest enforcement.
+
+    Algorithm:
+      1. Flatten Phase-1 shifts into individual instances.
+      2. Sort instances chronologically (earliest start first).
+      3. For each instance, try to assign it to the existing worker
+         with the *fewest remaining capacity* (best-fit) who satisfies
+         all constraints.  If no worker qualifies, create a new worker.
+      4. After all shifts assigned, report any worker under minimum hours.
     """
     t0 = time.time()
 
@@ -256,119 +314,68 @@ def solve_phase2(
     if not instances:
         return PhaseTwoResult([], [], 0, "NO_SHIFTS", 0.0)
 
+    # sort by global start so we assign in chronological order
+    instances.sort(key=lambda s: (s.global_start, s.duration_intervals))
+
     n_instances = len(instances)
     if callback:
-        callback(f"Phase 2: assigning {n_instances} shift instances to workers")
+        callback(f"Phase 2 (greedy): assigning {n_instances} shift instances")
 
-    # upper bound on workers needed
-    min_dur = min(s.duration_intervals for s in instances)
-    total_intervals = sum(s.duration_intervals for s in instances)
-    min_slots_per_worker = int(params.min_weekly_hours * INTERVALS_PER_HOUR)
-    max_workers = min(
-        n_instances,
-        int(np.ceil(total_intervals / min_slots_per_worker)) + 5
-    )
-    max_workers = max(max_workers, 1)
+    # worker state: list of (shift-list, total-intervals)
+    workers: List[List[CandidateShift]] = []
+    worker_totals: List[int] = []          # running duration-interval totals
 
-    # ---- model ----
-    model = cp_model.CpModel()
+    max_ivl = int(params.max_weekly_hours * INTERVALS_PER_HOUR)
 
-    # y[j, w] = 1 if instance j assigned to worker w
-    y = {}
-    for j in range(n_instances):
-        for w in range(max_workers):
-            y[j, w] = model.NewBoolVar(f"y_{j}_{w}")
+    for j, shift in enumerate(instances):
+        best_w = -1
+        best_remaining = max_ivl + 1  # lower remaining → tighter fit
 
-    # worker_used[w] = 1 if any shift assigned to worker w
-    worker_used = {}
-    for w in range(max_workers):
-        worker_used[w] = model.NewBoolVar(f"used_{w}")
+        for w_idx, (w_shifts, w_total) in enumerate(
+                zip(workers, worker_totals)):
+            remaining = max_ivl - w_total - shift.duration_intervals
+            if remaining < 0:
+                continue  # would exceed max hours
+            if remaining >= best_remaining:
+                continue  # not a tighter fit
+            if _can_assign(w_shifts, shift, params):
+                best_w = w_idx
+                best_remaining = remaining
 
-    # each instance assigned to exactly one worker
-    for j in range(n_instances):
-        model.AddExactlyOne(y[j, w] for w in range(max_workers))
+        if best_w >= 0:
+            workers[best_w].append(shift)
+            worker_totals[best_w] += shift.duration_intervals
+        else:
+            # create a new worker
+            workers.append([shift])
+            worker_totals.append(shift.duration_intervals)
 
-    # link worker_used
-    for w in range(max_workers):
-        model.AddMaxEquality(worker_used[w],
-                             [y[j, w] for j in range(n_instances)])
+        if callback and (j + 1) % 200 == 0:
+            callback(f"  … assigned {j + 1}/{n_instances} shifts, "
+                     f"{len(workers)} workers so far")
 
-    # weekly hours per worker
-    min_intervals = int(params.min_weekly_hours * INTERVALS_PER_HOUR)
-    max_intervals = int(params.max_weekly_hours * INTERVALS_PER_HOUR)
-
-    for w in range(max_workers):
-        total_w = sum(
-            y[j, w] * instances[j].duration_intervals
-            for j in range(n_instances)
-        )
-        # if worker is used, hours must be in range
-        model.Add(total_w >= min_intervals).OnlyEnforceIf(worker_used[w])
-        model.Add(total_w <= max_intervals).OnlyEnforceIf(worker_used[w])
-        model.Add(total_w == 0).OnlyEnforceIf(worker_used[w].Not())
-
-    # max shifts per day per worker  &  no overlapping shifts
-    for w in range(max_workers):
-        for day in range(7):
-            day_instances = [j for j in range(n_instances)
-                             if instances[j].day == day]
-            if not day_instances:
-                continue
-            # limit number of shifts
-            model.Add(
-                sum(y[j, w] for j in day_instances)
-                <= params.max_shifts_per_day_per_worker
-            )
-            # no overlap (for pairs on the same day)
-            if params.max_shifts_per_day_per_worker == 1:
-                continue  # only one shift → no overlap possible
-            for j1, j2 in itertools.combinations(day_instances, 2):
-                s1, s2 = instances[j1], instances[j2]
-                # if they overlap, they can't both be assigned to same worker
-                if not (s1.global_end <= s2.global_start or
-                        s2.global_end <= s1.global_start):
-                    model.Add(y[j1, w] + y[j2, w] <= 1)
-
-    # symmetry breaking: prefer lower-index workers
-    for w in range(1, max_workers):
-        model.Add(worker_used[w] <= worker_used[w - 1])
-
-    # objective: minimise workers
-    model.Minimize(sum(worker_used[w] for w in range(max_workers)))
-
-    if callback:
-        callback(f"Phase 2 model built (max_workers cap={max_workers}) – solving …")
-
-    # ---- solve ----
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = params.solver_time_limit_sec
-    solver.parameters.num_workers = 8
-    solver.parameters.log_search_progress = False
-
-    status_code = solver.Solve(model)
-    status_str = solver.StatusName(status_code)
-    elapsed = time.time() - t0
-
-    if status_code not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return PhaseTwoResult([], [], 0, status_str, elapsed)
-
-    # ---- extract schedules ----
+    # ---- build result ----
     schedules: List[List[CandidateShift]] = []
     hours_list: List[float] = []
-    for w in range(max_workers):
-        if solver.Value(worker_used[w]) == 0:
-            continue
-        w_shifts = [instances[j] for j in range(n_instances)
-                    if solver.Value(y[j, w]) == 1]
+    min_intervals = int(params.min_weekly_hours * INTERVALS_PER_HOUR)
+
+    under_min = 0
+    for w_shifts, w_total in zip(workers, worker_totals):
         w_shifts.sort(key=lambda s: s.global_start)
         schedules.append(w_shifts)
-        hours_list.append(
-            sum(s.duration_intervals for s in w_shifts) / INTERVALS_PER_HOUR
-        )
+        hrs = w_total / INTERVALS_PER_HOUR
+        hours_list.append(hrs)
+        if w_total < min_intervals:
+            under_min += 1
+
+    elapsed = time.time() - t0
+    status_str = "FEASIBLE"
+    if under_min > 0:
+        status_str = f"FEASIBLE ({under_min} workers below min hours)"
 
     if callback:
         callback(f"Phase 2 done: {len(schedules)} workers, "
-                 f"status={status_str}")
+                 f"status={status_str}, {elapsed:.1f} s")
 
     return PhaseTwoResult(schedules, hours_list, len(schedules),
                           status_str, elapsed)
@@ -448,3 +455,105 @@ def coverage_dataframe(result: FullResult) -> pd.DataFrame:
         "Demand": result.demand.astype(int),
         "Coverage": result.phase1.coverage.astype(int),
     })
+
+
+def shift_type_summary(p1: PhaseOneResult) -> pd.DataFrame:
+    """
+    Shift types in HHMM-HHMM format with count per day and totals.
+    """
+    from collections import defaultdict
+    type_day: Dict[str, Dict[str, int]] = defaultdict(lambda: {d: 0 for d in DAY_NAMES})
+    type_dur: Dict[str, float] = {}
+
+    for s, cnt in zip(p1.shifts, p1.counts):
+        if cnt > 0:
+            code = s.shift_code
+            type_day[code][DAY_NAMES[s.day]] += cnt
+            type_dur[code] = s.duration_hours
+
+    rows = []
+    for code in sorted(type_day.keys()):
+        row = {"ShiftType": code, "Duration(h)": type_dur[code]}
+        total = 0
+        for d in DAY_NAMES:
+            row[d] = type_day[code][d]
+            total += type_day[code][d]
+        row["Total"] = total
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_weekly_report_xlsx(result: FullResult) -> bytes:
+    """
+    Build a multi-sheet XLSX report:
+      Sheet 1 – Roster           (worker, day, shift HHMM-HHMM, hours)
+      Sheet 2 – Worker Summary   (worker, total hours, FTE, shifts per day)
+      Sheet 3 – Shift Types      (HHMM-HHMM, duration, count per day)
+      Sheet 4 – Coverage         (interval, demand, coverage)
+    """
+    import io as _io
+    p1 = result.phase1
+    p2 = result.phase2
+
+    buf = _io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        wb = writer.book
+
+        # ── Sheet 1: Roster ──────────────────────────────────────────────
+        roster_rows = []
+        for w_idx, (schedule, hrs) in enumerate(
+                zip(p2.worker_schedules, p2.worker_hours)):
+            for s in schedule:
+                roster_rows.append({
+                    "Worker": f"EMP-{w_idx + 1:03d}",
+                    "Day": DAY_NAMES[s.day],
+                    "Shift": s.shift_code,
+                    "Start": s.start_time_str,
+                    "End": s.end_time_str,
+                    "Hours": s.duration_hours,
+                })
+        roster_df = pd.DataFrame(roster_rows)
+        if not roster_df.empty:
+            roster_df.sort_values(["Worker", "Day"], inplace=True,
+                                  key=lambda c: c.map(
+                                      {d: i for i, d in enumerate(DAY_NAMES)}
+                                  ) if c.name == "Day" else c)
+            roster_df.reset_index(drop=True, inplace=True)
+        roster_df.to_excel(writer, sheet_name="Roster", index=False)
+
+        # ── Sheet 2: Worker Summary ──────────────────────────────────────
+        summary_rows = []
+        for w_idx, (schedule, hrs) in enumerate(
+                zip(p2.worker_schedules, p2.worker_hours)):
+            row: Dict = {
+                "Worker": f"EMP-{w_idx + 1:03d}",
+                "TotalHours": round(hrs, 1),
+                "FTE(÷45)": round(hrs / 45.0, 2),
+                "Shifts": len(schedule),
+            }
+            for d in range(7):
+                day_shifts = [s for s in schedule if s.day == d]
+                if day_shifts:
+                    row[DAY_NAMES[d]] = ", ".join(s.shift_code for s in day_shifts)
+                else:
+                    row[DAY_NAMES[d]] = "OFF"
+            summary_rows.append(row)
+        summary_df = pd.DataFrame(summary_rows)
+        summary_df.to_excel(writer, sheet_name="Worker Summary", index=False)
+
+        # auto-size columns
+        ws = writer.sheets["Worker Summary"]
+        for i, col in enumerate(summary_df.columns):
+            max_len = max(summary_df[col].astype(str).str.len().max(),
+                          len(col)) + 2
+            ws.set_column(i, i, max_len)
+
+        # ── Sheet 3: Shift Types ─────────────────────────────────────────
+        st_df = shift_type_summary(p1)
+        st_df.to_excel(writer, sheet_name="Shift Types", index=False)
+
+        # ── Sheet 4: Coverage ────────────────────────────────────────────
+        cov_df = coverage_dataframe(result)
+        cov_df.to_excel(writer, sheet_name="Coverage", index=False)
+
+    return buf.getvalue()

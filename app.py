@@ -18,7 +18,7 @@ import streamlit as st
 from solver import (
     TOTAL_INTERVALS, INTERVALS_PER_DAY, INTERVALS_PER_HOUR, DAY_NAMES,
     SolverParams, solve, shifts_to_dataframe, schedules_to_dataframe,
-    coverage_dataframe,
+    coverage_dataframe, shift_type_summary, build_weekly_report_xlsx,
 )
 from sample_data import generate_sample_demand, demand_to_dataframe
 
@@ -64,6 +64,10 @@ with st.sidebar:
     st.subheader("Worker Constraints")
     max_shifts_day = st.number_input(
         "Max shifts per day per worker", 1, 3, 1
+    )
+    min_rest = st.number_input(
+        "Min rest between shifts (h)", 0.0, 24.0, 12.0, 1.0,
+        help="Legal minimum rest period between consecutive shifts",
     )
 
     st.subheader("Solver")
@@ -204,6 +208,7 @@ if st.button("🚀 Run Optimiser", type="primary"):
         min_weekly_hours=min_weekly,
         max_weekly_hours=max_weekly,
         max_shifts_per_day_per_worker=max_shifts_day,
+        min_rest_hours=min_rest,
         solver_time_limit_sec=time_limit,
     )
 
@@ -233,19 +238,23 @@ st.header("3 – Results")
 p1 = result.phase1
 st.subheader("Phase 1 – Set Covering")
 
-mcol1, mcol2, mcol3, mcol4, mcol5, mcol6 = st.columns(6)
+mcol1, mcol2, mcol3, mcol4, mcol5, mcol6, mcol7 = st.columns(7)
 mcol1.metric("Status", p1.status)
 mcol2.metric("Active shifts",
              sum(1 for c in p1.counts if c > 0) if p1.counts else 0)
 total_wh = p1.total_worker_intervals / INTERVALS_PER_HOUR if p1.counts else 0
 mcol3.metric("Total worker-hours", f"{total_wh:,.0f}")
-# Headcount = peak simultaneous workers needed (max coverage value)
+# Headcount = total unique workers from Phase 2
+p2_preview = result.phase2
+headcount = p2_preview.num_workers if p2_preview.num_workers else "–"
+mcol4.metric("Headcount", headcount)
+# Peak simultaneous workers needed (max coverage value)
 peak_headcount = int(p1.coverage.max()) if p1.counts else 0
-mcol4.metric("Peak Headcount", peak_headcount)
+mcol5.metric("Peak Simultaneous", peak_headcount)
 # FTE = total worker-hours / 45
 fte = total_wh / 45.0
-mcol5.metric("FTE (÷45 h)", f"{fte:.1f}")
-mcol6.metric("Solve time", f"{p1.elapsed_sec:.1f} s")
+mcol6.metric("FTE (÷45 h)", f"{fte:.1f}")
+mcol7.metric("Solve time", f"{p1.elapsed_sec:.1f} s")
 
 if p1.status not in ("OPTIMAL", "FEASIBLE"):
     st.error(f"Solver returned **{p1.status}** – try relaxing constraints.")
@@ -375,9 +384,8 @@ with st.expander("📋 Active Shifts (Phase 1)"):
 p2 = result.phase2
 if p2.status == "SKIPPED":
     st.info("Phase 2 was skipped.")
-elif p2.status not in ("OPTIMAL", "FEASIBLE"):
-    st.warning(f"Phase 2 status: **{p2.status}** – worker assignment may "
-               "need relaxed constraints (increase weekly-hour window).")
+elif p2.status == "NO_SHIFTS":
+    st.warning("No shift instances to assign.")
 else:
     st.subheader("Phase 2 – Worker Assignment")
     wcol1, wcol2, wcol3, wcol4, wcol5 = st.columns(5)
@@ -392,6 +400,9 @@ else:
     wcol3.metric("FTE (÷45 h)", f"{fte_p2:.1f}")
     wcol4.metric("Total assigned hours", f"{total_assigned_hrs:,.0f}")
     wcol5.metric("Solve time", f"{p2.elapsed_sec:.1f} s")
+
+    if "BELOW" in p2.status.upper() or "below" in p2.status:
+        st.warning(f"⚠️ {p2.status}")
 
     sched_df = schedules_to_dataframe(p2)
 
@@ -411,14 +422,14 @@ else:
             end_h = d * 24 + eh + em / 60
             fig3.add_trace(go.Bar(
                 x=[end_h - start_h],
-                y=[f"W{w}"],
+                y=[f"EMP-{w:03d}"],
                 base=start_h,
                 orientation="h",
                 marker_color=colors[d % len(colors)],
                 name=DAY_NAMES[d],
                 showlegend=False,
                 hovertemplate=(
-                    f"Worker {w}<br>{DAY_NAMES[d]} "
+                    f"EMP-{w:03d}<br>{DAY_NAMES[d]} "
                     f"{row['Start']}–{row['End']} "
                     f"({row['DurationHrs']:.1f} h)<extra></extra>"
                 ),
@@ -426,7 +437,7 @@ else:
         fig3.update_layout(
             barmode="stack",
             height=max(300, p2.num_workers * 28 + 80),
-            margin=dict(l=50, r=20, t=30, b=50),
+            margin=dict(l=70, r=20, t=30, b=50),
             xaxis=dict(
                 title="Hour of week",
                 tickvals=[d * 24 + 12 for d in range(7)],
@@ -458,27 +469,61 @@ else:
         )
         st.plotly_chart(fig4, use_container_width=True)
 
-    # ---- Schedule table ----
-    with st.expander("📋 Full Worker Schedules"):
-        st.dataframe(sched_df, use_container_width=True, hide_index=True)
-        csv2 = sched_df.to_csv(index=False)
-        st.download_button("Download schedules CSV", csv2,
-                           file_name="worker_schedules.csv", mime="text/csv")
+    # ---- Shift Type Summary ----
+    with st.expander("📋 Shift Types (HHMM-HHMM)", expanded=True):
+        st_df = shift_type_summary(p1)
+        st.dataframe(st_df, use_container_width=True, hide_index=True)
+
+    # ---- Full Roster table ----
+    with st.expander("📋 Full Roster"):
+        # build roster with EMP IDs and shift codes
+        roster_rows = []
+        for w_idx, (schedule, hrs) in enumerate(
+                zip(p2.worker_schedules, p2.worker_hours)):
+            for s in schedule:
+                roster_rows.append({
+                    "Worker": f"EMP-{w_idx + 1:03d}",
+                    "Day": DAY_NAMES[s.day],
+                    "Shift": s.shift_code,
+                    "Start": s.start_time_str,
+                    "End": s.end_time_str,
+                    "Hours": s.duration_hours,
+                    "WeeklyHrs": hrs,
+                })
+        roster_df = pd.DataFrame(roster_rows)
+        st.dataframe(roster_df, use_container_width=True, hide_index=True)
 
     # ---- Per-worker summary ----
     with st.expander("👤 Per-Worker Summary"):
         summary_rows = []
         for w_idx, (sched, hrs) in enumerate(
                 zip(p2.worker_schedules, p2.worker_hours)):
-            days_worked = sorted(set(s.day for s in sched))
-            summary_rows.append({
-                "Worker": w_idx + 1,
+            row = {
+                "Worker": f"EMP-{w_idx + 1:03d}",
                 "Shifts": len(sched),
-                "Days": ", ".join(DAY_NAMES[d][:3] for d in days_worked),
                 "WeeklyHours": f"{hrs:.1f}",
-            })
+                "FTE(÷45)": f"{hrs / 45.0:.2f}",
+            }
+            for d in range(7):
+                day_shifts = [s for s in sched if s.day == d]
+                if day_shifts:
+                    row[DAY_NAMES[d][:3]] = ", ".join(
+                        s.shift_code for s in day_shifts)
+                else:
+                    row[DAY_NAMES[d][:3]] = "OFF"
+            summary_rows.append(row)
         st.dataframe(pd.DataFrame(summary_rows),
                      use_container_width=True, hide_index=True)
+
+    # ---- XLSX Download ----
+    st.subheader("⬇️ Download Weekly Report")
+    xlsx_bytes = build_weekly_report_xlsx(result)
+    st.download_button(
+        "📥 Download XLSX Report",
+        data=xlsx_bytes,
+        file_name="weekly_shift_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 # ── Footer ───────────────────────────────────────────────────────────────────
 st.divider()
