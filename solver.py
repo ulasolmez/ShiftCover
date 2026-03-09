@@ -17,7 +17,7 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import io as _io
 import numpy as np
@@ -101,10 +101,10 @@ class SolverParams:
     allow_overnight: bool         = False
     # Per-day limits on distinct entry/exit times (0 = unlimited)
     # Each is a list of 7 ints (Mon–Sun). If None → no constraint.
-    max_entries_per_day: List[int] | None = None
-    max_exits_per_day: List[int] | None = None
+    max_entries_per_day: Optional[List[int]] = None
+    max_exits_per_day: Optional[List[int]] = None
     # Per-day max simultaneous workers (0 = unlimited). List of 7 ints.
-    max_headcount_per_day: List[int] | None = None
+    max_headcount_per_day: Optional[List[int]] = None
     # Exclude shifts that fall entirely within the 20:00–06:00 window
     exclude_night_shifts: bool = False
     # Circular week: Sunday shifts can wrap into Monday
@@ -551,7 +551,7 @@ def solve_phase2(
 def solve_multi(
     demands: List[np.ndarray],
     occ_names: List[str],
-    params: SolverParams | None = None,
+    params: Optional[SolverParams] = None,
     callback=None,
 ) -> MultiCurveResult:
     if params is None:
@@ -583,7 +583,7 @@ def solve_multi(
 
 def solve(
     demand: np.ndarray,
-    params: SolverParams | None = None,
+    params: Optional[SolverParams] = None,
     callback=None,
 ) -> MultiCurveResult:
     """Backward-compatible single-curve wrapper."""
