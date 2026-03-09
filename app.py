@@ -41,10 +41,6 @@ with st.sidebar:
     max_shift = st.slider("Max shift (h)", 6.0, 12.0, 12.0, 0.5)
     max_unique = st.number_input("Max unique shifts (0 = unlimited)", 0, 200, 0)
 
-    st.subheader("Granularity")
-    start_step = st.selectbox("Shift-start step (min)",
-                              [5, 10, 15, 30, 60], index=2)
-
     st.subheader("Weekly hours")
     min_wh = st.number_input("Min weekly hours", 20.0, 60.0, 40.0, 1.0)
     max_wh = st.number_input("Max weekly hours", 20.0, 60.0, 50.0, 1.0)
@@ -59,7 +55,7 @@ with st.sidebar:
 params = SolverParams(
     min_shift_hours=min_shift,
     max_shift_hours=max_shift,
-    shift_start_granularity_min=start_step,
+    shift_start_granularity_min=30,
     shift_duration_step_min=30,
     min_weekly_hours=min_wh,
     max_weekly_hours=max_wh,
