@@ -79,7 +79,11 @@ class CandidateShift:
         return f"{sh:02d}{sm:02d}-{eh:02d}{em:02d}"
 
     def covers(self, global_interval: int) -> bool:
-        return self.global_start <= global_interval < self.global_end
+        if self.global_end <= TOTAL_INTERVALS:
+            return self.global_start <= global_interval < self.global_end
+        # Wrapping shift (Sunday → Monday)
+        return (global_interval >= self.global_start or
+                global_interval < self.global_end - TOTAL_INTERVALS)
 
 
 @dataclass
@@ -103,6 +107,8 @@ class SolverParams:
     max_headcount_per_day: List[int] | None = None
     # Exclude shifts that fall entirely within the 20:00–06:00 window
     exclude_night_shifts: bool = False
+    # Circular week: Sunday shifts can wrap into Monday
+    circular_week: bool = False
 
 
 @dataclass
@@ -159,14 +165,22 @@ def generate_candidate_shifts(params: SolverParams) -> List[CandidateShift]:
         for start in range(0, INTERVALS_PER_DAY, start_step):
             for dur in range(min_dur, max_dur + 1, dur_step):
                 end_interval = start + dur
-                if not params.allow_overnight and end_interval > INTERVALS_PER_DAY:
-                    continue
-                if end_interval > INTERVALS_PER_DAY:
-                    continue
+                # Sunday wrapping: allow crossing midnight into Monday
+                is_sun_wrap = (day == 6 and params.circular_week)
+                if not is_sun_wrap:
+                    if not params.allow_overnight and end_interval > INTERVALS_PER_DAY:
+                        continue
+                    if end_interval > INTERVALS_PER_DAY:
+                        continue
+                else:
+                    # Cap at max_shift_hours past midnight
+                    if end_interval > INTERVALS_PER_DAY + max_dur:
+                        continue
                 # Skip complete night shifts (entirely within 20:00-06:00)
                 if params.exclude_night_shifts:
                     if start >= night_start:          # starts at/after 20:00
-                        continue                      # ends before 24:00 (no overnight)
+                        if end_interval <= INTERVALS_PER_DAY:
+                            continue                  # fully night within the day
                     if end_interval <= night_end:      # starts and ends before 06:00
                         continue
                 shifts.append(CandidateShift(idx, day, start, dur))
@@ -179,8 +193,8 @@ def build_coverage_map(
 ) -> Dict[int, List[int]]:
     cov: Dict[int, List[int]] = {t: [] for t in range(TOTAL_INTERVALS)}
     for s in shifts:
-        for t in range(s.global_start, min(s.global_end, TOTAL_INTERVALS)):
-            cov[t].append(s.idx)
+        for t in range(s.global_start, s.global_end):
+            cov[t % TOTAL_INTERVALS].append(s.idx)
     return cov
 
 
@@ -368,7 +382,8 @@ def solve_phase1_multi(
         coverage = np.zeros(TOTAL_INTERVALS, dtype=int)
         for s, cnt in zip(shifts, counts):
             if cnt > 0:
-                coverage[s.global_start:s.global_end] += cnt
+                for t in range(s.global_start, s.global_end):
+                    coverage[t % TOTAL_INTERVALS] += cnt
         total_wi = sum(c * s.duration_intervals
                        for s, c in zip(shifts, counts))
         per_occ.append(PhaseOneResult(
@@ -396,6 +411,14 @@ def solve_phase1_multi(
 
 
 # ── Phase 2 – Worker Assignment (greedy with rest constraint) ────────────────
+def _shift_ranges(s: CandidateShift):
+    """Return list of (start, end) interval ranges, handling week wrap."""
+    if s.global_end <= TOTAL_INTERVALS:
+        return [(s.global_start, s.global_end)]
+    return [(s.global_start, TOTAL_INTERVALS),
+            (0, s.global_end - TOTAL_INTERVALS)]
+
+
 def _can_assign(
     worker_shifts: List[CandidateShift],
     shift: CandidateShift,
@@ -408,16 +431,41 @@ def _can_assign(
     if current + shift.duration_intervals > max_ivl:
         return False
 
+    s_ranges = _shift_ranges(shift)
+
     for ex in worker_shifts:
-        # overlap check
-        if not (shift.global_end <= ex.global_start or
-                ex.global_end <= shift.global_start):
+        ex_ranges = _shift_ranges(ex)
+
+        # overlap check (compare all range pairs)
+        overlap = False
+        for (a1, a2) in s_ranges:
+            for (b1, b2) in ex_ranges:
+                if not (a2 <= b1 or b2 <= a1):
+                    overlap = True
+                    break
+            if overlap:
+                break
+        if overlap:
             return False
+
         # rest gap check
-        if ex.global_end <= shift.global_start:
-            gap = shift.global_start - ex.global_end
+        has_wrap = (shift.global_end > TOTAL_INTERVALS or
+                    ex.global_end > TOTAL_INTERVALS)
+        if has_wrap:
+            # circular gap: effective ends wrapped
+            e_ex = (ex.global_end % TOTAL_INTERVALS
+                    if ex.global_end > TOTAL_INTERVALS
+                    else ex.global_end)
+            e_sh = (shift.global_end % TOTAL_INTERVALS
+                    if shift.global_end > TOTAL_INTERVALS
+                    else shift.global_end)
+            gap = min((shift.global_start - e_ex) % TOTAL_INTERVALS,
+                      (ex.global_start - e_sh) % TOTAL_INTERVALS)
         else:
-            gap = ex.global_start - shift.global_end
+            if ex.global_end <= shift.global_start:
+                gap = shift.global_start - ex.global_end
+            else:
+                gap = ex.global_start - shift.global_end
         if gap < rest_ivl:
             return False
     return True
