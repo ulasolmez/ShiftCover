@@ -44,7 +44,6 @@ with st.sidebar:
     st.subheader("Granularity")
     start_step = st.selectbox("Shift-start step (min)",
                               [5, 10, 15, 30, 60], index=2)
-    dur_step = st.selectbox("Duration step (min)", [15, 30, 60], index=1)
 
     st.subheader("Weekly hours")
     min_wh = st.number_input("Min weekly hours", 20.0, 60.0, 40.0, 1.0)
@@ -61,7 +60,7 @@ params = SolverParams(
     min_shift_hours=min_shift,
     max_shift_hours=max_shift,
     shift_start_granularity_min=start_step,
-    shift_duration_step_min=dur_step,
+    shift_duration_step_min=30,
     min_weekly_hours=min_wh,
     max_weekly_hours=max_wh,
     min_rest_hours=min_rest,
