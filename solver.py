@@ -98,7 +98,6 @@ class SolverParams:
     max_unique_shifts: int        = 0          # 0 = unlimited
     transition_penalty: int       = 50
     solver_time_limit_sec: int    = 120
-    allow_overnight: bool         = False
     # Per-day limits on distinct entry/exit times (0 = unlimited)
     # Each is a list of 7 ints (Mon–Sun). If None → no constraint.
     max_entries_per_day: Optional[List[int]] = None
@@ -159,30 +158,42 @@ def generate_candidate_shifts(params: SolverParams) -> List[CandidateShift]:
 
     shifts: List[CandidateShift] = []
     idx = 0
-    night_start = 240   # 20:00 = interval 240
-    night_end   = 72    # 06:00 = interval 72
+    # Night window boundaries (in within-day intervals)
+    night_start = 240   # 20:00
+    night_end_next = INTERVALS_PER_DAY + 72   # next-day 06:00 = 360
+    night_end_same = 72  # 06:00 within same day
     for day in range(7):
         for start in range(0, INTERVALS_PER_DAY, start_step):
             for dur in range(min_dur, max_dur + 1, dur_step):
                 end_interval = start + dur
-                # Sunday wrapping: allow crossing midnight into Monday
-                is_sun_wrap = (day == 6 and params.circular_week)
-                if not is_sun_wrap:
-                    if not params.allow_overnight and end_interval > INTERVALS_PER_DAY:
-                        continue
-                    if end_interval > INTERVALS_PER_DAY:
-                        continue
-                else:
-                    # Cap at max_shift_hours past midnight
-                    if end_interval > INTERVALS_PER_DAY + max_dur:
-                        continue
-                # Skip complete night shifts (entirely within 20:00-06:00)
+                is_overnight = end_interval > INTERVALS_PER_DAY
+                is_sun_wrap = (day == 6 and is_overnight)
+
+                # Block Sunday overnight unless circular_week
+                if is_sun_wrap and not params.circular_week:
+                    continue
+                # For non-Sunday days, allow overnight into next day
+                # but cap at one day boundary (can't span 2+ days)
+                if is_overnight and not is_sun_wrap:
+                    if day < 6:
+                        # shift bleeds into next day – OK
+                        pass
+                    else:
+                        continue  # Sunday without circular
+
+                # Skip complete night shifts (entirely within 20:00–06:00)
                 if params.exclude_night_shifts:
-                    if start >= night_start:          # starts at/after 20:00
-                        if end_interval <= INTERVALS_PER_DAY:
-                            continue                  # fully night within the day
-                    if end_interval <= night_end:      # starts and ends before 06:00
+                    if start >= night_start and end_interval <= night_end_next:
+                        # Starts at/after 20:00 and ends at/before next-day 06:00
+                        # e.g. 22:00-04:00 → EXCLUDED
+                        # e.g. 22:00-08:00 → NOT excluded (end > 360)
+                        # e.g. 20:00-00:00 → EXCLUDED (end 288 <= 360)
                         continue
+                    if start < night_end_same and end_interval <= night_end_same:
+                        # Starts and ends before 06:00 on same day
+                        # e.g. 00:00-05:00 → EXCLUDED
+                        continue
+
                 shifts.append(CandidateShift(idx, day, start, dur))
                 idx += 1
     return shifts
