@@ -95,6 +95,10 @@ class SolverParams:
     transition_penalty: int       = 50
     solver_time_limit_sec: int    = 120
     allow_overnight: bool         = False
+    # Per-day limits on distinct entry/exit times (0 = unlimited)
+    # Each is a list of 7 ints (Mon–Sun). If None → no constraint.
+    max_entries_per_day: List[int] | None = None
+    max_exits_per_day: List[int] | None = None
 
 
 @dataclass
@@ -222,6 +226,58 @@ def solve_phase1_multi(
         model.add(sum(z[s.idx] for s in shifts) <= params.max_unique_shifts)
         if callback:
             callback(f"Max unique shifts ≤ {params.max_unique_shifts}")
+
+    # Per-day max distinct entry times
+    if params.max_entries_per_day:
+        # Collect distinct start_intervals per day
+        day_starts: Dict[int, set] = {d: set() for d in range(7)}
+        for s in shifts:
+            day_starts[s.day].add(s.start_interval)
+        for day in range(7):
+            limit = params.max_entries_per_day[day]
+            if limit <= 0:
+                continue
+            starts = sorted(day_starts[day])
+            if len(starts) <= limit:
+                continue  # already within limit, no constraint needed
+            # e_start[day][si] = 1 iff any shift on this day with start_interval==si is active
+            e_vars = []
+            for si in starts:
+                e = model.new_bool_var(f"entry_d{day}_s{si}")
+                matching = [s.idx for s in shifts
+                            if s.day == day and s.start_interval == si]
+                model.add(sum(z[idx] for idx in matching) >= 1).only_enforce_if(e)
+                model.add(sum(z[idx] for idx in matching) == 0).only_enforce_if(e.negated())
+                e_vars.append(e)
+            model.add(sum(e_vars) <= limit)
+        if callback:
+            callback(f"Max entries/day: {params.max_entries_per_day}")
+
+    # Per-day max distinct exit times
+    if params.max_exits_per_day:
+        day_ends: Dict[int, set] = {d: set() for d in range(7)}
+        for s in shifts:
+            end_ivl = s.start_interval + s.duration_intervals
+            day_ends[s.day].add(end_ivl)
+        for day in range(7):
+            limit = params.max_exits_per_day[day]
+            if limit <= 0:
+                continue
+            ends = sorted(day_ends[day])
+            if len(ends) <= limit:
+                continue
+            x_vars = []
+            for ei in ends:
+                ev = model.new_bool_var(f"exit_d{day}_e{ei}")
+                matching = [s.idx for s in shifts
+                            if s.day == day
+                            and s.start_interval + s.duration_intervals == ei]
+                model.add(sum(z[idx] for idx in matching) >= 1).only_enforce_if(ev)
+                model.add(sum(z[idx] for idx in matching) == 0).only_enforce_if(ev.negated())
+                x_vars.append(ev)
+            model.add(sum(x_vars) <= limit)
+        if callback:
+            callback(f"Max exits/day: {params.max_exits_per_day}")
 
     # Per-occupation coverage constraints
     for occ in range(n_occ):

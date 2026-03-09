@@ -48,6 +48,25 @@ with st.sidebar:
     st.subheader("Worker constraints")
     min_rest = st.number_input("Min rest between shifts (h)", 8.0, 24.0, 12.0, 1.0)
 
+    st.subheader("Entry / Exit limits per day")
+    st.caption("Max distinct start times (entries) and end times (exits) "
+               "per day. 0 = unlimited.")
+    DAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    max_entries = []
+    max_exits = []
+    for d in range(7):
+        col_e, col_x = st.columns(2)
+        with col_e:
+            e = st.number_input(f"{DAY_SHORT[d]} entries",
+                                0, 48, 0, key=f"ent_{d}")
+            max_entries.append(e)
+        with col_x:
+            x = st.number_input(f"{DAY_SHORT[d]} exits",
+                                0, 48, 0, key=f"ext_{d}")
+            max_exits.append(x)
+    use_entries = any(v > 0 for v in max_entries)
+    use_exits = any(v > 0 for v in max_exits)
+
     st.subheader("Solver")
     time_limit = st.number_input("Time limit (s)", 10, 600, 120, 10)
     t_penalty = st.number_input("Transition penalty", 0, 500, 50, 10)
@@ -63,6 +82,8 @@ params = SolverParams(
     max_unique_shifts=max_unique,
     transition_penalty=t_penalty,
     solver_time_limit_sec=time_limit,
+    max_entries_per_day=max_entries if use_entries else None,
+    max_exits_per_day=max_exits if use_exits else None,
 )
 
 
