@@ -99,6 +99,8 @@ class SolverParams:
     # Each is a list of 7 ints (Mon–Sun). If None → no constraint.
     max_entries_per_day: List[int] | None = None
     max_exits_per_day: List[int] | None = None
+    # Per-day max simultaneous workers (0 = unlimited). List of 7 ints.
+    max_headcount_per_day: List[int] | None = None
 
 
 @dataclass
@@ -278,6 +280,26 @@ def solve_phase1_multi(
             model.add(sum(x_vars) <= limit)
         if callback:
             callback(f"Max exits/day: {params.max_exits_per_day}")
+
+    # Per-day max simultaneous headcount
+    if params.max_headcount_per_day:
+        for day in range(7):
+            limit = params.max_headcount_per_day[day]
+            if limit <= 0:
+                continue
+            day_start = day * INTERVALS_PER_DAY
+            day_end = day_start + INTERVALS_PER_DAY
+            for t in range(day_start, day_end):
+                covering = cov[t]
+                if not covering:
+                    continue
+                # sum across ALL occupations at interval t
+                total_at_t = []
+                for occ in range(n_occ):
+                    total_at_t.extend(x[occ][si] for si in covering)
+                model.add(sum(total_at_t) <= limit)
+        if callback:
+            callback(f"Max headcount/day: {params.max_headcount_per_day}")
 
     # Per-occupation coverage constraints
     for occ in range(n_occ):

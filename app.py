@@ -67,6 +67,16 @@ with st.sidebar:
     use_entries = any(v > 0 for v in max_entries)
     use_exits = any(v > 0 for v in max_exits)
 
+    st.subheader("Max headcount per day")
+    st.caption("Max simultaneous workers (all occupations) per day. "
+               "0 = unlimited.")
+    max_hc = []
+    for d in range(7):
+        h = st.number_input(f"{DAY_SHORT[d]} max headcount",
+                            0, 500, 0, key=f"hc_{d}")
+        max_hc.append(h)
+    use_hc = any(v > 0 for v in max_hc)
+
     st.subheader("Solver")
     time_limit = st.number_input("Time limit (s)", 10, 600, 120, 10)
     t_penalty = st.number_input("Transition penalty", 0, 500, 50, 10)
@@ -84,6 +94,7 @@ params = SolverParams(
     solver_time_limit_sec=time_limit,
     max_entries_per_day=max_entries if use_entries else None,
     max_exits_per_day=max_exits if use_exits else None,
+    max_headcount_per_day=max_hc if use_hc else None,
 )
 
 
