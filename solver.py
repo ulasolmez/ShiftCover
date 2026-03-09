@@ -101,6 +101,8 @@ class SolverParams:
     max_exits_per_day: List[int] | None = None
     # Per-day max simultaneous workers (0 = unlimited). List of 7 ints.
     max_headcount_per_day: List[int] | None = None
+    # Exclude shifts that fall entirely within the 20:00–06:00 window
+    exclude_night_shifts: bool = False
 
 
 @dataclass
@@ -151,6 +153,8 @@ def generate_candidate_shifts(params: SolverParams) -> List[CandidateShift]:
 
     shifts: List[CandidateShift] = []
     idx = 0
+    night_start = 240   # 20:00 = interval 240
+    night_end   = 72    # 06:00 = interval 72
     for day in range(7):
         for start in range(0, INTERVALS_PER_DAY, start_step):
             for dur in range(min_dur, max_dur + 1, dur_step):
@@ -159,6 +163,12 @@ def generate_candidate_shifts(params: SolverParams) -> List[CandidateShift]:
                     continue
                 if end_interval > INTERVALS_PER_DAY:
                     continue
+                # Skip complete night shifts (entirely within 20:00-06:00)
+                if params.exclude_night_shifts:
+                    if start >= night_start:          # starts at/after 20:00
+                        continue                      # ends before 24:00 (no overnight)
+                    if end_interval <= night_end:      # starts and ends before 06:00
+                        continue
                 shifts.append(CandidateShift(idx, day, start, dur))
                 idx += 1
     return shifts

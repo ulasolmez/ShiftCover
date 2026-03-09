@@ -40,6 +40,7 @@ with st.sidebar:
     min_shift = st.slider("Min shift (h)", 3.0, 8.0, 3.0, 0.5)
     max_shift = st.slider("Max shift (h)", 6.0, 12.0, 12.0, 0.5)
     max_unique = st.number_input("Max unique shifts (0 = unlimited)", 0, 200, 0)
+    no_night = st.checkbox("Exclude night shifts (20:00–06:00)", value=False)
 
     st.subheader("Weekly hours")
     min_wh = st.number_input("Min weekly hours", 20.0, 60.0, 40.0, 1.0)
@@ -95,6 +96,7 @@ params = SolverParams(
     max_entries_per_day=max_entries if use_entries else None,
     max_exits_per_day=max_exits if use_exits else None,
     max_headcount_per_day=max_hc if use_hc else None,
+    exclude_night_shifts=no_night,
 )
 
 
