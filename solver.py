@@ -540,7 +540,7 @@ def _can_assign(
             if overlap:
                 break
         if overlap:
-            return Falsez
+            return False
 
         # rest gap check
         has_wrap = (shift.global_end > TOTAL_INTERVALS or
