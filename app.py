@@ -250,10 +250,28 @@ result: MultiCurveResult | None = st.session_state.get("result")
 
 if result is not None:
     st.divider()
-    st.header("📊 Results")
 
     cp1 = result.combined_phase1
     n_occ = len(result.occupations)
+
+    # ── Infeasibility guard ──────────────────────────────────────────────
+    _feasible = cp1.status in ("OPTIMAL", "FEASIBLE")
+    if not _feasible:
+        st.header("📊 Results")
+        st.error(
+            f"**Solver status: {cp1.status}**  (solved in {cp1.elapsed_sec:.1f}s)\n\n"
+            "The model has no feasible solution with the current settings. "
+            "Try relaxing one or more constraints:\n"
+            "- Widen the shift-duration range (lower min / raise max)\n"
+            "- Reduce minimum weekly hours or raise maximum weekly hours\n"
+            "- Lower minimum rest hours between shifts\n"
+            "- Remove or loosen entry / exit / headcount limits\n"
+            "- Uncheck *Exclude night shifts* if demand peaks at night\n"
+            "- Increase the solver time limit (the solver may need more time)"
+        )
+        st.stop()
+
+    st.header("📊 Results")
 
     # ── Phase 1 summary metrics ──────────────────────────────────────────
     st.subheader("Phase 1 – Set Covering")
