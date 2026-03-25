@@ -14,7 +14,7 @@ from solver import (
     INTERVALS_PER_DAY, INTERVALS_PER_HOUR, TOTAL_INTERVALS,
     DAY_NAMES, OCC_COLORS,
     SolverParams, MultiCurveResult,
-    solve_multi,
+    solve_multi, list_possible_shift_codes,
     coverage_dataframe, shifts_to_dataframe, schedules_to_dataframe,
     shift_type_summary, build_weekly_report_xlsx,
 )
@@ -42,6 +42,29 @@ with st.sidebar:
     max_unique = st.number_input("Max unique shifts (0 = unlimited)", 0, 200, 0)
     no_night = st.checkbox("Exclude night shifts (≥8 h with >50 % in 20:00–06:00)", value=False)
     circular = st.checkbox("Circular week (Sunday → Monday)", value=False)
+
+    # Build list of possible shift codes based on current settings
+    _preview_params = SolverParams(
+        min_shift_hours=min_shift, max_shift_hours=max_shift,
+        shift_start_granularity_min=30, shift_duration_step_min=30,
+        exclude_night_shifts=no_night,
+    )
+    _all_codes = list_possible_shift_codes(_preview_params)
+
+    st.subheader("Force include / exclude shifts")
+    st.caption(f"{len(_all_codes)} possible shift patterns")
+    force_incl = st.multiselect(
+        "Must include (solver will always use these)",
+        options=_all_codes, default=[], key="force_incl")
+    # Remove already-included codes from exclude options
+    _excl_options = [c for c in _all_codes if c not in set(force_incl)]
+    force_excl = st.multiselect(
+        "Must exclude (solver will never use these)",
+        options=_excl_options, default=[], key="force_excl")
+    # Warn if conflict (should not happen due to filtering, but guard)
+    _conflict = set(force_incl) & set(force_excl)
+    if _conflict:
+        st.warning(f"Conflict: {', '.join(sorted(_conflict))} in both lists")
 
     st.subheader("Weekly hours")
     min_wh = st.number_input("Min weekly hours", 20.0, 60.0, 40.0, 1.0)
@@ -99,6 +122,8 @@ params = SolverParams(
     max_headcount_per_day=max_hc if use_hc else None,
     exclude_night_shifts=no_night,
     circular_week=circular,
+    force_include_shifts=force_incl if force_incl else None,
+    force_exclude_shifts=force_excl if force_excl else None,
 )
 
 

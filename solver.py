@@ -108,6 +108,9 @@ class SolverParams:
     exclude_night_shifts: bool = False
     # Circular week: Sunday shifts can wrap into Monday
     circular_week: bool = False
+    # Force include/exclude specific shift codes (e.g. ["0630-1430"])
+    force_include_shifts: Optional[List[str]] = None
+    force_exclude_shifts: Optional[List[str]] = None
 
 
 @dataclass
@@ -199,11 +202,38 @@ def is_night_shift(start: int, dur: int) -> bool:
 
 
 # ── Candidate-shift generation ───────────────────────────────────────────────
+def _shift_code_from(start: int, dur: int) -> str:
+    """Compute HHMM-HHMM code from start interval and duration intervals."""
+    sh, sm = divmod(start * 5, 60)
+    total_end = (start + dur) * 5
+    eh, em = divmod(total_end, 60)
+    if eh >= 24:
+        eh -= 24
+    return f"{sh:02d}{sm:02d}-{eh:02d}{em:02d}"
+
+
+def list_possible_shift_codes(params: SolverParams) -> List[str]:
+    """Return sorted list of unique HHMM-HHMM shift codes for given params."""
+    start_step = max(1, params.shift_start_granularity_min // 5)
+    dur_step   = max(1, params.shift_duration_step_min // 5)
+    min_dur    = int(params.min_shift_hours * INTERVALS_PER_HOUR)
+    max_dur    = int(params.max_shift_hours * INTERVALS_PER_HOUR)
+    codes: set = set()
+    for start in range(0, INTERVALS_PER_DAY, start_step):
+        for dur in range(min_dur, max_dur + 1, dur_step):
+            if params.exclude_night_shifts and is_night_shift(start, dur):
+                continue
+            codes.add(_shift_code_from(start, dur))
+    return sorted(codes)
+
+
 def generate_candidate_shifts(params: SolverParams) -> List[CandidateShift]:
     start_step = max(1, params.shift_start_granularity_min // 5)
     dur_step   = max(1, params.shift_duration_step_min // 5)
     min_dur    = int(params.min_shift_hours * INTERVALS_PER_HOUR)
     max_dur    = int(params.max_shift_hours * INTERVALS_PER_HOUR)
+
+    _excl_set = set(params.force_exclude_shifts) if params.force_exclude_shifts else set()
 
     shifts: List[CandidateShift] = []
     idx = 0
@@ -221,6 +251,11 @@ def generate_candidate_shifts(params: SolverParams) -> List[CandidateShift]:
                         continue  # Sunday without circular
 
                 if params.exclude_night_shifts and is_night_shift(start, dur):
+                    continue
+
+                if (params.force_exclude_shifts
+                        and _shift_code_from(start, dur)
+                        in _excl_set):
                     continue
 
                 shifts.append(CandidateShift(idx, day, start, dur))
@@ -286,6 +321,20 @@ def solve_phase1_multi(
     for occ in range(n_occ):
         for s in shifts:
             model.add(x[occ][s.idx] == 0).only_enforce_if(z[s.idx].negated())
+
+    # Force-include shift codes: every matching code must be active
+    if params.force_include_shifts:
+        incl_set = set(params.force_include_shifts)
+        # Group candidate indices by shift_code
+        code_to_idxs: Dict[str, List[int]] = {}
+        for s in shifts:
+            if s.shift_code in incl_set:
+                code_to_idxs.setdefault(s.shift_code, []).append(s.idx)
+        for code, idxs in code_to_idxs.items():
+            # At least one candidate with this code must be active
+            model.add(sum(z[i] for i in idxs) >= 1)
+        if callback:
+            callback(f"Force-include {len(code_to_idxs)} shift code(s)")
 
     # Max unique shifts (shared cardinality)
     if params.max_unique_shifts > 0:
@@ -491,7 +540,7 @@ def _can_assign(
             if overlap:
                 break
         if overlap:
-            return False
+            return Falsez
 
         # rest gap check
         has_wrap = (shift.global_end > TOTAL_INTERVALS or
