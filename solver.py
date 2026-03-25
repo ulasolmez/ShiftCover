@@ -149,6 +149,55 @@ class MultiCurveResult:
 FullResult = MultiCurveResult
 
 
+# ── Night / break helpers ────────────────────────────────────────────────────
+_NIGHT_START = 240   # 20:00  (within-day interval)
+_NIGHT_END   = 72    # 06:00  (within-day interval)
+
+
+def night_overlap_intervals(start: int, end: int) -> int:
+    """Return how many 5-min intervals of [start, end) overlap 20:00-06:00.
+
+    ``start`` is a within-day interval [0, 288); ``end`` = start + duration,
+    may exceed 288 for overnight shifts.
+    """
+    total = 0
+    # Split into current-day [start, min(end,288)) and next-day [0, end-288)
+    ranges = [(start, min(end, INTERVALS_PER_DAY))]
+    if end > INTERVALS_PER_DAY:
+        ranges.append((0, end - INTERVALS_PER_DAY))
+    for a, b in ranges:
+        # Night windows: morning [0, 72) and evening [240, 288)
+        total += max(0, min(b, _NIGHT_END) - max(a, 0))
+        total += max(0, min(b, INTERVALS_PER_DAY) - max(a, _NIGHT_START))
+    return total
+
+
+def night_overlap_hours(start: int, end: int) -> float:
+    return night_overlap_intervals(start, end) / INTERVALS_PER_HOUR
+
+
+def break_hours(duration_hours: float) -> float:
+    """Mandatory break: 30 min for 4-7.5 h shifts, 1 h for ≥8 h shifts."""
+    if duration_hours >= 8.0:
+        return 1.0
+    if duration_hours >= 4.0:
+        return 0.5
+    return 0.0
+
+
+def effective_hours(duration_hours: float) -> float:
+    return duration_hours - break_hours(duration_hours)
+
+
+def is_night_shift(start: int, dur: int) -> bool:
+    """True when duration ≥ 8 h AND night overlap > half the shift duration."""
+    dur_h = dur / INTERVALS_PER_HOUR
+    if dur_h < 8.0:
+        return False
+    night_h = night_overlap_hours(start, start + dur)
+    return night_h > dur_h / 2.0
+
+
 # ── Candidate-shift generation ───────────────────────────────────────────────
 def generate_candidate_shifts(params: SolverParams) -> List[CandidateShift]:
     start_step = max(1, params.shift_start_granularity_min // 5)
@@ -158,10 +207,6 @@ def generate_candidate_shifts(params: SolverParams) -> List[CandidateShift]:
 
     shifts: List[CandidateShift] = []
     idx = 0
-    # Night window boundaries (in within-day intervals)
-    night_start = 240   # 20:00
-    night_end_next = INTERVALS_PER_DAY + 72   # next-day 06:00 = 360
-    night_end_same = 72  # 06:00 within same day
     for day in range(7):
         for start in range(0, INTERVALS_PER_DAY, start_step):
             for dur in range(min_dur, max_dur + 1, dur_step):
@@ -169,30 +214,14 @@ def generate_candidate_shifts(params: SolverParams) -> List[CandidateShift]:
                 is_overnight = end_interval > INTERVALS_PER_DAY
                 is_sun_wrap = (day == 6 and is_overnight)
 
-                # Block Sunday overnight unless circular_week
                 if is_sun_wrap and not params.circular_week:
                     continue
-                # For non-Sunday days, allow overnight into next day
-                # but cap at one day boundary (can't span 2+ days)
                 if is_overnight and not is_sun_wrap:
-                    if day < 6:
-                        # shift bleeds into next day – OK
-                        pass
-                    else:
+                    if day >= 6:
                         continue  # Sunday without circular
 
-                # Skip complete night shifts (entirely within 20:00–06:00)
-                if params.exclude_night_shifts:
-                    if start >= night_start and end_interval <= night_end_next:
-                        # Starts at/after 20:00 and ends at/before next-day 06:00
-                        # e.g. 22:00-04:00 → EXCLUDED
-                        # e.g. 22:00-08:00 → NOT excluded (end > 360)
-                        # e.g. 20:00-00:00 → EXCLUDED (end 288 <= 360)
-                        continue
-                    if start < night_end_same and end_interval <= night_end_same:
-                        # Starts and ends before 06:00 on same day
-                        # e.g. 00:00-05:00 → EXCLUDED
-                        continue
+                if params.exclude_night_shifts and is_night_shift(start, dur):
+                    continue
 
                 shifts.append(CandidateShift(idx, day, start, dur))
                 idx += 1
