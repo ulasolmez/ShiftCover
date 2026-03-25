@@ -230,6 +230,24 @@ if demands is not None:
 
 # ── Solve ────────────────────────────────────────────────────────────────────
 if demands is not None:
+    # Demand summary
+    total_demand_h = sum(d.sum() for d in demands) / INTERVALS_PER_HOUR
+    peak_total = int(sum(demands).max())
+    _sc1, _sc2 = st.columns(2)
+    _sc1.metric("Total demand (worker-hours)", f"{total_demand_h:,.0f}")
+    _sc2.metric("Peak simultaneous demand", peak_total)
+
+    # Input validation
+    _warnings: list[str] = []
+    if min_shift > max_shift:
+        _warnings.append("Min shift hours > Max shift hours")
+    if min_wh > max_wh:
+        _warnings.append("Min weekly hours > Max weekly hours")
+    if min_rest + min_shift > 24:
+        _warnings.append("Min rest + Min shift > 24 h — no two shifts can fit in one day")
+    for w in _warnings:
+        st.warning(w)
+
     if st.button("▶ Run Optimiser", type="primary"):
         log_box = st.empty()
         log_lines: list[str] = []
@@ -288,6 +306,33 @@ if result is not None:
     c5.metric("Peak Simultaneous", peak_sim)
     c6.metric("FTE (÷45)", f"{total_wh / 45:.1f}")
     c7.metric("Solve time", f"{cp1.elapsed_sec:.1f}s")
+
+    # ── Coverage quality ─────────────────────────────────────────────────
+    _combined_dem = result.combined_demand
+    _deficit = np.maximum(_combined_dem - cp1.coverage, 0)
+    _deficit_intervals = int(np.count_nonzero(_deficit))
+    _total_intervals_with_demand = int(np.count_nonzero(_combined_dem))
+    _pct_covered = (
+        100.0 * (1 - _deficit_intervals / _total_intervals_with_demand)
+        if _total_intervals_with_demand > 0 else 100.0
+    )
+    _gap_wh = float(_deficit.sum()) / INTERVALS_PER_HOUR
+    _max_deficit = int(_deficit.max()) if _deficit_intervals > 0 else 0
+    _surplus = np.maximum(cp1.coverage - _combined_dem, 0)
+    _surplus_wh = float(_surplus.sum()) / INTERVALS_PER_HOUR
+
+    cq1, cq2, cq3, cq4 = st.columns(4)
+    cq1.metric("Coverage", f"{_pct_covered:.1f} %")
+    cq2.metric("Under-coverage", f"{_gap_wh:,.1f} wh")
+    cq3.metric("Max deficit", _max_deficit)
+    cq4.metric("Over-coverage", f"{_surplus_wh:,.1f} wh")
+
+    if _deficit_intervals > 0:
+        st.warning(
+            f"Demand is not fully covered: **{_deficit_intervals}** intervals "
+            f"({_gap_wh:.1f} worker-hours) remain below demand. "
+            f"Peak deficit: **{_max_deficit}** workers."
+        )
 
     # per-occupation headcount
     if n_occ > 1:
@@ -393,6 +438,18 @@ if result is not None:
         line=dict(color="green", width=2),
         fill="tozeroy", fillcolor="rgba(0,128,0,0.08)",
     ))
+    # shade deficit (demand > coverage)
+    _day_deficit = np.maximum(td - tc, 0)
+    if _day_deficit.any():
+        fig_day.add_trace(go.Scatter(
+            x=day_x, y=td, mode="lines", name="Deficit",
+            line=dict(width=0), showlegend=True,
+        ))
+        fig_day.add_trace(go.Scatter(
+            x=day_x, y=tc, mode="lines", name="_deficit_fill",
+            line=dict(width=0), showlegend=False,
+            fill="tonexty", fillcolor="rgba(255,0,0,0.25)",
+        ))
     if n_occ > 1:
         for i, occ in enumerate(result.occupations):
             clr = OCC_COLORS[i % len(OCC_COLORS)]
