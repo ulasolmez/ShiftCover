@@ -137,8 +137,7 @@ with tab_upload:
     st.info(f"Upload **{n_curves} file(s)** — one per occupation. "
             "Each must have {TOTAL_INTERVALS} rows with a numeric column "
             "(e.g. 'Required').")
-    st.page_link("pages/1_How_to_Format_CSV.py",
-                 label="📄 How to format your CSV", icon="❓")
+    st.markdown("❓ [📄 How to format your CSV](/How_to_Format_CSV)")
     uploaded_files = []
     for i in range(n_curves):
         f = st.file_uploader(
