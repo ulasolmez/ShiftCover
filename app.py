@@ -137,7 +137,51 @@ with tab_upload:
     st.info(f"Upload **{n_curves} file(s)** — one per occupation. "
             "Each must have {TOTAL_INTERVALS} rows with a numeric column "
             "(e.g. 'Required').")
-    st.markdown("❓ [📄 How to format your CSV](/How_to_Format_CSV)")
+    with st.expander("❓ How to format your CSV"):
+        st.markdown("""
+**The optimiser needs one file per occupation** — a single numeric column
+with **2 016 rows** (7 days × 288 five-minute intervals).
+
+| Property | Value |
+|---|---|
+| File type | `.csv` (comma-delimited) or `.xlsx` |
+| Rows | Exactly **2 016** |
+| Column name | `Required` or `Demand` (or first numeric column) |
+| Row order | Monday 00:00 → Sunday 23:55 |
+| Interval | 5 minutes |
+
+**Step-by-step**
+1. Ensure every 5-min slot exists (288 per day × 7 days = 2 016 rows).
+   If your data uses 15- or 30-min steps, repeat each value to fill the 5-min slots.
+2. Sort chronologically: Monday 00:00 at the top, Sunday 23:55 at the bottom.
+3. Include a numeric column named `Required` or `Demand`. Extra columns (Day, Time, …) are ignored.
+4. Save as `.csv` with comma delimiters.
+
+**Example (first rows):**
+```
+Day,Time,Required
+Monday,00:00,2
+Monday,00:05,2
+Monday,00:10,3
+```
+
+**Or minimal single-column:**
+```
+Required
+2
+2
+3
+```
+
+**Tips:** Zeros are fine for off-hours. Decimals are rounded automatically.
+Use the *Generate sample* tab to see the exact format.
+
+| Common error | Fix |
+|---|---|
+| *Need 2016 rows, got N* | Ensure all 7 × 288 slots are present |
+| *No numeric column found* | Add a numeric `Required` column |
+| *Missing file for …* | Upload a file for each occupation |
+""")
     uploaded_files = []
     for i in range(n_curves):
         f = st.file_uploader(
