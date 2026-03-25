@@ -459,6 +459,15 @@ def _shift_ranges(s: CandidateShift):
             (0, s.global_end - TOTAL_INTERVALS)]
 
 
+def _occupied_days(s: CandidateShift) -> set:
+    """Return set of calendar days (0-6) a shift occupies."""
+    days = {s.day}
+    if s.global_end > (s.day + 1) * INTERVALS_PER_DAY:
+        next_day = (s.day + 1) % 7
+        days.add(next_day)
+    return days
+
+
 def _can_assign(
     worker_shifts: List[CandidateShift],
     shift: CandidateShift,
@@ -470,6 +479,12 @@ def _can_assign(
     current = sum(s.duration_intervals for s in worker_shifts)
     if current + shift.duration_intervals > max_ivl:
         return False
+
+    # one shift per calendar day
+    new_days = _occupied_days(shift)
+    for ex in worker_shifts:
+        if _occupied_days(ex) & new_days:
+            return False
 
     s_ranges = _shift_ranges(shift)
 
