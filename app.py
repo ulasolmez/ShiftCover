@@ -53,11 +53,29 @@ with st.sidebar:
 
     st.subheader("Force include / exclude shifts")
     st.caption(f"{len(_all_codes)} possible shift patterns")
+    st.markdown("""<style>
+    div:has(> .green-ms) + div [data-baseweb="tag"] {
+        background-color: #2e7d32 !important; color: white !important;
+    }
+    div:has(> .green-ms) + div [data-baseweb="tag"] span,
+    div:has(> .green-ms) + div [data-baseweb="tag"] svg {
+        color: white !important; fill: white !important;
+    }
+    div:has(> .red-ms) + div [data-baseweb="tag"] {
+        background-color: #c62828 !important; color: white !important;
+    }
+    div:has(> .red-ms) + div [data-baseweb="tag"] span,
+    div:has(> .red-ms) + div [data-baseweb="tag"] svg {
+        color: white !important; fill: white !important;
+    }
+    </style>""", unsafe_allow_html=True)
+    st.markdown('<span class="green-ms"></span>', unsafe_allow_html=True)
     force_incl = st.multiselect(
         "Must include (solver will always use these)",
         options=_all_codes, default=[], key="force_incl")
     # Remove already-included codes from exclude options
     _excl_options = [c for c in _all_codes if c not in set(force_incl)]
+    st.markdown('<span class="red-ms"></span>', unsafe_allow_html=True)
     force_excl = st.multiselect(
         "Must exclude (solver will never use these)",
         options=_excl_options, default=[], key="force_excl")
