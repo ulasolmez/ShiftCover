@@ -756,6 +756,61 @@ def coverage_dataframe(result: MultiCurveResult) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
+# ERP day mapping: 0=Sunday, 1=Monday, ..., 6=Saturday
+_ERP_DAY = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 0}  # solver day → ERP day
+
+_SHIFTTYPE_HEADER = (
+    '<Version=7.9.73082/><Class Name=CShifttype/>'
+    '<Block Name=Shifttype/><Tab Name=Shifttype/>'
+)
+
+
+def _build_shifttype_rows(result: MultiCurveResult) -> List[Dict]:
+    """Build ERP Shifttype rows from combined Phase 1 results."""
+    p1 = result.combined_phase1
+
+    # Collect per shift-code: days used (ERP numbering) + timing info
+    code_days: Dict[str, set] = defaultdict(set)
+    code_info: Dict[str, Dict] = {}
+
+    for s, cnt in zip(p1.shifts, p1.counts):
+        if cnt <= 0:
+            continue
+        code = s.shift_code
+        code_days[code].add(_ERP_DAY[s.day])
+        if code not in code_info:
+            begin_min = s.start_interval * 5
+            end_min = (s.start_interval + s.duration_intervals) * 5
+            if end_min >= 1440:
+                end_min -= 1440
+            dur_min = s.duration_intervals * 5
+            code_info[code] = {
+                "begin": begin_min,
+                "end": end_min,
+                "duration": dur_min,
+            }
+
+    rows = []
+    all_days = {0, 1, 2, 3, 4, 5, 6}
+    for code in sorted(code_info):
+        info = code_info[code]
+        days_used = code_days[code]
+        if days_used == all_days:
+            multi = ""
+        else:
+            multi = "".join(str(d) for d in sorted(days_used, reverse=True))
+        rows.append({
+            "begin": info["begin"],
+            "BGColor": 18,
+            "code": code,
+            "duration": info["duration"],
+            "end": info["end"],
+            "FGColor": 24,
+            "fullTime": 1,
+            "multiDays": multi,
+        })
+    return rows
+
 def shift_type_summary(
     p1: PhaseOneResult,
     label: str = "",
@@ -844,5 +899,14 @@ def build_weekly_report_xlsx(result: MultiCurveResult) -> bytes:
         # ── Coverage ─────────────────────────────────────────────────────
         coverage_dataframe(result).to_excel(
             writer, sheet_name="Coverage", index=False)
+
+        # ── ERP Shifttype ────────────────────────────────────────────────
+        st_rows = _build_shifttype_rows(result)
+        if st_rows:
+            st_df = pd.DataFrame(st_rows)
+            st_df.to_excel(writer, sheet_name="Shifttype",
+                           index=False, startrow=1)
+            ws_st = writer.sheets["Shifttype"]
+            ws_st.write(0, 0, _SHIFTTYPE_HEADER)
 
     return buf.getvalue()
