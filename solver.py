@@ -111,6 +111,10 @@ class SolverParams:
     # Force include/exclude specific shift codes (e.g. ["0630-1430"])
     force_include_shifts: Optional[List[str]] = None
     force_exclude_shifts: Optional[List[str]] = None
+    # Cost-based objective (0 = disabled, falls back to FTE minimisation)
+    personnel_cost_per_fte: float = 0.0   # monetary cost per FTE (worker_h / 45)
+    shuttle_cost_per_trip: float  = 0.0   # monetary cost per shuttle trip
+    shuttle_capacity: int         = 14    # workers per shuttle
 
 
 @dataclass
@@ -121,6 +125,7 @@ class PhaseOneResult:
     coverage: np.ndarray
     status: str
     elapsed_sec: float
+    estimated_cost: float = 0.0
 
 
 @dataclass
@@ -429,15 +434,68 @@ def solve_phase1_multi(
         callback(f"Coverage constraints added for {n_occ} occupation(s)")
 
     # ---- objective ----
+    _cost_mode = (
+        params.personnel_cost_per_fte > 0 or params.shuttle_cost_per_trip > 0
+    )
+    # Integer scale: 1 unit = 0.01 monetary (cent precision)
+    _SCALE = 100
+
     obj_terms = []
-    for occ in range(n_occ):
-        for s in shifts:
-            obj_terms.append(x[occ][s.idx] * s.duration_intervals)
+
+    if _cost_mode:
+        # FTE component: cost per worker-interval = cost_per_fte * SCALE / (45 * IPH)
+        _fte_coeff = int(round(
+            params.personnel_cost_per_fte * _SCALE / (45.0 * INTERVALS_PER_HOUR)
+        ))
+        if _fte_coeff > 0:
+            for occ in range(n_occ):
+                for s in shifts:
+                    obj_terms.append(x[occ][s.idx] * s.duration_intervals * _fte_coeff)
+        # Shuttle component: group workers by (day, entry_time) and (exit_day, exit_time)
+        _shu_coeff = int(round(params.shuttle_cost_per_trip * _SCALE))
+        if _shu_coeff > 0:
+            _cap = max(1, params.shuttle_capacity)
+            _max_workers = int(sum(int(d.max()) for d in demands)) + 1
+            _max_shuttles = (_max_workers + _cap - 1) // _cap + 1
+            # build entry/exit groups: (day, time_ivl) -> list of shift indices
+            _entry_grp: Dict[tuple, List[int]] = defaultdict(list)
+            _exit_grp:  Dict[tuple, List[int]] = defaultdict(list)
+            for s in shifts:
+                _entry_grp[(s.day, s.start_interval)].append(s.idx)
+                _exit_ivl = s.start_interval + s.duration_intervals
+                _exit_day = s.day
+                if _exit_ivl >= INTERVALS_PER_DAY:
+                    _exit_ivl -= INTERVALS_PER_DAY
+                    _exit_day = (_exit_day + 1) % 7
+                _exit_grp[(_exit_day, _exit_ivl)].append(s.idx)
+            for (d, t), idxs in _entry_grp.items():
+                workers = sum(
+                    x[occ][i] for occ in range(n_occ) for i in idxs)
+                n_sh = model.new_int_var(0, _max_shuttles, f"she_{d}_{t}")
+                model.add(n_sh * _cap >= workers)
+                obj_terms.append(n_sh * _shu_coeff)
+            for (d, t), idxs in _exit_grp.items():
+                workers = sum(
+                    x[occ][i] for occ in range(n_occ) for i in idxs)
+                n_sh = model.new_int_var(0, _max_shuttles, f"shx_{d}_{t}")
+                model.add(n_sh * _cap >= workers)
+                obj_terms.append(n_sh * _shu_coeff)
+        if callback:
+            callback(
+                f"Cost mode: FTE @{params.personnel_cost_per_fte} "
+                f"shuttle @{params.shuttle_cost_per_trip} cap={params.shuttle_capacity}"
+            )
+    else:
+        # Default: minimise total worker-intervals (proportional to FTE)
+        for occ in range(n_occ):
+            for s in shifts:
+                obj_terms.append(x[occ][s.idx] * s.duration_intervals)
 
     tp = params.transition_penalty
     if tp > 0:
+        _tp_scaled = tp * _SCALE if _cost_mode else tp
         for s in shifts:
-            obj_terms.append(z[s.idx] * tp * 2)
+            obj_terms.append(z[s.idx] * _tp_scaled * 2)
         if callback:
             callback(f"Transition penalty {tp} on shared shift activation")
 
@@ -483,18 +541,49 @@ def solve_phase1_multi(
 
     combined_wi = sum(c * s.duration_intervals
                       for s, c in zip(shifts, combined_counts))
+
+    # Compute estimated monetary cost from solution values
+    _est_cost = 0.0
+    if _cost_mode:
+        total_wh = combined_wi / INTERVALS_PER_HOUR
+        _est_cost += params.personnel_cost_per_fte * (total_wh / 45.0)
+        if params.shuttle_cost_per_trip > 0:
+            _cap = max(1, params.shuttle_capacity)
+            # count workers entering/exiting per (day, slot) from combined counts
+            _entry_workers: Dict[tuple, int] = defaultdict(int)
+            _exit_workers:  Dict[tuple, int] = defaultdict(int)
+            for s, cnt in zip(shifts, combined_counts):
+                if cnt == 0:
+                    continue
+                _entry_workers[(s.day, s.start_interval)] += cnt
+                _exit_ivl = s.start_interval + s.duration_intervals
+                _exit_day = s.day
+                if _exit_ivl >= INTERVALS_PER_DAY:
+                    _exit_ivl -= INTERVALS_PER_DAY
+                    _exit_day = (_exit_day + 1) % 7
+                _exit_workers[(_exit_day, _exit_ivl)] += cnt
+            import math
+            shuttle_trips = sum(
+                math.ceil(w / _cap)
+                for w in list(_entry_workers.values()) + list(_exit_workers.values())
+            )
+            _est_cost += shuttle_trips * params.shuttle_cost_per_trip
+
     combined_p1 = PhaseOneResult(
         shifts, combined_counts, combined_wi, combined_coverage,
-        status_str, elapsed)
+        status_str, elapsed, estimated_cost=_est_cost)
 
     if callback:
         for occ in range(n_occ):
             wh = per_occ[occ].total_worker_intervals / INTERVALS_PER_HOUR
             callback(f"  {occ_names[occ]}: {wh:.0f} worker-hours")
         n_active = sum(1 for c in combined_counts if c > 0)
-        callback(f"Phase 1 done: status={status_str}, "
-                 f"total worker-hours={combined_wi/INTERVALS_PER_HOUR:.0f}, "
-                 f"unique shifts={n_active}")
+        msg = (f"Phase 1 done: status={status_str}, "
+               f"total worker-hours={combined_wi/INTERVALS_PER_HOUR:.0f}, "
+               f"unique shifts={n_active}")
+        if _cost_mode:
+            msg += f", estimated cost={_est_cost:,.0f}"
+        callback(msg)
 
     return per_occ, combined_p1
 

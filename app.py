@@ -124,6 +124,15 @@ with st.sidebar:
     time_limit = st.number_input("Time limit (s)", 10, 600, 120, 10)
     t_penalty = st.number_input("Transition penalty", 0, 500, 50, 10)
 
+    st.subheader("Cost optimisation")
+    st.caption("Set unit costs to minimise total cost instead of FTE. Leave both at 0 to keep the default FTE minimisation.")
+    pers_cost = st.number_input("Personnel cost per FTE", 0.0, 1e7, 0.0, 100.0,
+                                help="Monetary cost per FTE (worker-hours ÷ 45). E.g. weekly salary.")
+    shuttle_cost = st.number_input("Shuttle cost per trip", 0.0, 1e6, 0.0, 10.0,
+                                   help="Cost per shuttle run (one entry or exit trip).")
+    shuttle_cap = st.number_input("Shuttle capacity", 1, 100, 14, 1,
+                                  help="Passengers per shuttle. Used to calculate number of trips.")
+
 params = SolverParams(
     min_shift_hours=min_shift,
     max_shift_hours=max_shift,
@@ -142,6 +151,9 @@ params = SolverParams(
     circular_week=circular,
     force_include_shifts=force_incl if force_incl else None,
     force_exclude_shifts=force_excl if force_excl else None,
+    personnel_cost_per_fte=pers_cost,
+    shuttle_cost_per_trip=shuttle_cost,
+    shuttle_capacity=int(shuttle_cap),
 )
 
 
@@ -394,6 +406,20 @@ if result is not None:
     c5.metric("Peak Simultaneous", peak_sim)
     c6.metric("FTE (÷45)", f"{total_wh / 45:.1f}")
     c7.metric("Solve time", f"{cp1.elapsed_sec:.1f}s")
+
+    _result_params = st.session_state.get("result_params")
+    if (_result_params and
+            (_result_params.personnel_cost_per_fte > 0
+             or _result_params.shuttle_cost_per_trip > 0)):
+        _fte_cost  = _result_params.personnel_cost_per_fte * (total_wh / 45.0)
+        _sh_cost   = cp1.estimated_cost - _fte_cost
+        _cc1, _cc2, _cc3 = st.columns(3)
+        _cc1.metric("💰 Total estimated cost",
+                    f"{cp1.estimated_cost:,.0f}")
+        _cc2.metric("  Personnel cost (FTE)",
+                    f"{_fte_cost:,.0f}")
+        _cc3.metric("  Shuttle cost",
+                    f"{_sh_cost:,.0f}")
 
     # ── Coverage quality ─────────────────────────────────────────────────
     _combined_dem = result.combined_demand
