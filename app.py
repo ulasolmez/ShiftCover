@@ -132,6 +132,8 @@ with st.sidebar:
                                    help="Cost per shuttle run (one entry or exit trip).")
     shuttle_cap = st.number_input("Shuttle capacity", 1, 100, 14, 1,
                                   help="Passengers per shuttle. Used to calculate number of trips.")
+    max_cost = st.number_input("Max total cost (budget cap)", 0.0, 1e9, 0.0, 1000.0,
+                               help="Hard upper bound on FTE + shuttle cost. 0 = no cap.")
 
 params = SolverParams(
     min_shift_hours=min_shift,
@@ -154,6 +156,7 @@ params = SolverParams(
     personnel_cost_per_fte=pers_cost,
     shuttle_cost_per_trip=shuttle_cost,
     shuttle_capacity=int(shuttle_cap),
+    max_total_cost=max_cost if max_cost > 0 else None,
 )
 
 
@@ -345,6 +348,8 @@ if demands is not None:
         _warnings.append("Min weekly hours > Max weekly hours")
     if min_rest + min_shift > 24:
         _warnings.append("Min rest + Min shift > 24 h — no two shifts can fit in one day")
+    if max_cost > 0 and pers_cost == 0 and shuttle_cost == 0:
+        _warnings.append("Budget cap is set but both unit costs are 0 — cap has no effect (cost mode is off)")
     for w in _warnings:
         st.warning(w)
 

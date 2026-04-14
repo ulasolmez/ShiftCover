@@ -115,6 +115,7 @@ class SolverParams:
     personnel_cost_per_fte: float = 0.0   # monetary cost per FTE (worker_h / 45)
     shuttle_cost_per_trip: float  = 0.0   # monetary cost per shuttle trip
     shuttle_capacity: int         = 14    # workers per shuttle
+    max_total_cost: Optional[float] = None  # hard budget cap (FTE + shuttle); None = no cap
 
 
 @dataclass
@@ -440,7 +441,10 @@ def solve_phase1_multi(
     # Integer scale: 1 unit = 0.01 monetary (cent precision)
     _SCALE = 100
 
-    obj_terms = []
+    # cost_terms: real monetary cost (FTE + shuttle) — used for budget constraint
+    # obj_terms:  full objective = cost_terms + transition penalty
+    cost_terms = []
+    obj_terms  = []
 
     if _cost_mode:
         # FTE component: cost per worker-interval = cost_per_fte * SCALE / (45 * IPH)
@@ -450,7 +454,7 @@ def solve_phase1_multi(
         if _fte_coeff > 0:
             for occ in range(n_occ):
                 for s in shifts:
-                    obj_terms.append(x[occ][s.idx] * s.duration_intervals * _fte_coeff)
+                    cost_terms.append(x[occ][s.idx] * s.duration_intervals * _fte_coeff)
         # Shuttle component: group workers by (day, entry_time) and (exit_day, exit_time)
         _shu_coeff = int(round(params.shuttle_cost_per_trip * _SCALE))
         if _shu_coeff > 0:
@@ -473,13 +477,20 @@ def solve_phase1_multi(
                     x[occ][i] for occ in range(n_occ) for i in idxs)
                 n_sh = model.new_int_var(0, _max_shuttles, f"she_{d}_{t}")
                 model.add(n_sh * _cap >= workers)
-                obj_terms.append(n_sh * _shu_coeff)
+                cost_terms.append(n_sh * _shu_coeff)
             for (d, t), idxs in _exit_grp.items():
                 workers = sum(
                     x[occ][i] for occ in range(n_occ) for i in idxs)
                 n_sh = model.new_int_var(0, _max_shuttles, f"shx_{d}_{t}")
                 model.add(n_sh * _cap >= workers)
-                obj_terms.append(n_sh * _shu_coeff)
+                cost_terms.append(n_sh * _shu_coeff)
+        # Hard budget cap: FTE + shuttle cost <= max_total_cost
+        if params.max_total_cost and params.max_total_cost > 0 and cost_terms:
+            _budget_scaled = int(round(params.max_total_cost * _SCALE))
+            model.add(sum(cost_terms) <= _budget_scaled)
+            if callback:
+                callback(f"Budget cap: {params.max_total_cost} (scaled {_budget_scaled})")
+        obj_terms = list(cost_terms)
         if callback:
             callback(
                 f"Cost mode: FTE @{params.personnel_cost_per_fte} "
