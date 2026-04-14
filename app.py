@@ -18,7 +18,7 @@ from solver import (
     coverage_dataframe, shifts_to_dataframe, schedules_to_dataframe,
     shift_type_summary, build_weekly_report_xlsx,
 )
-from sample_data import generate_sample_demand
+from sample_data import generate_sample_demand, generate_noisy_demand
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="ShiftCover", layout="wide")
@@ -277,15 +277,28 @@ with tab_sample:
             peaks.append(pk)
             bases.append(bs)
     sample_seed = st.number_input("Random seed", 0, 9999, 42)
+    noisy_profile = st.toggle("Noisy / irregular profile",
+                              help="Randomises peak times, magnitudes, and adds spikes each day.")
+    if noisy_profile:
+        noise_level = st.slider("Noise level", 1.0, 5.0, 3.0, 0.5,
+                                help="1 = mild irregularity, 5 = chaotic / stress-test.")
 
     if st.button("🎲 Generate sample", key="btn_sample"):
         demands = []
         for i in range(n_curves):
-            d = generate_sample_demand(
-                peak_agents=peaks[i],
-                base_agents=bases[i],
-                seed=sample_seed + i * 7,
-            )
+            if noisy_profile:
+                d = generate_noisy_demand(
+                    peak_agents=peaks[i],
+                    base_agents=bases[i],
+                    noise_level=noise_level,
+                    seed=sample_seed + i * 7,
+                )
+            else:
+                d = generate_sample_demand(
+                    peak_agents=peaks[i],
+                    base_agents=bases[i],
+                    seed=sample_seed + i * 7,
+                )
             demands.append(d)
         st.session_state["demands"] = demands
         st.session_state["occ_names"] = occ_names[:]
