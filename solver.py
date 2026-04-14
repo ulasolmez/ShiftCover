@@ -485,8 +485,10 @@ def solve_phase1_multi(
                 model.add(n_sh * _cap >= workers)
                 cost_terms.append(n_sh * _shu_coeff)
         # Hard budget cap: FTE + shuttle cost <= max_total_cost
+        # Use ceil so integer rounding never makes the constraint tighter than intended.
         if params.max_total_cost and params.max_total_cost > 0 and cost_terms:
-            _budget_scaled = int(round(params.max_total_cost * _SCALE))
+            import math as _math
+            _budget_scaled = _math.ceil(params.max_total_cost * _SCALE)
             model.add(sum(cost_terms) <= _budget_scaled)
             if callback:
                 callback(f"Budget cap: {params.max_total_cost} (scaled {_budget_scaled})")

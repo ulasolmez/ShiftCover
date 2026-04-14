@@ -394,17 +394,47 @@ if result is not None:
     _feasible = cp1.status in ("OPTIMAL", "FEASIBLE")
     if not _feasible:
         st.header("📊 Results")
-        st.error(
-            f"**Solver status: {cp1.status}**  (solved in {cp1.elapsed_sec:.1f}s)\n\n"
-            "The model has no feasible solution with the current settings. "
-            "Try relaxing one or more constraints:\n"
-            "- Widen the shift-duration range (lower min / raise max)\n"
-            "- Reduce minimum weekly hours or raise maximum weekly hours\n"
-            "- Lower minimum rest hours between shifts\n"
-            "- Remove or loosen entry / exit / headcount limits\n"
-            "- Uncheck *Exclude night shifts* if demand peaks at night\n"
-            "- Increase the solver time limit (the solver may need more time)"
+        _has_budget = bool(
+            _result_params and
+            _result_params.max_total_cost and
+            _result_params.max_total_cost > 0
         )
+        if cp1.status == "UNKNOWN":
+            _msg = (
+                f"**Solver timed out** (status: UNKNOWN, {cp1.elapsed_sec:.1f}s)\n\n"
+                "No feasible solution was found within the time limit. "
+                "This is **not** the same as infeasible — the solution may exist but "
+                "the solver ran out of time searching for it.\n\n"
+                "Try one or more of the following:\n"
+                "- **Increase the solver time limit** (most likely fix)\n"
+            )
+            if _has_budget:
+                _msg += (
+                    "- **Raise or remove the budget cap** — a tight budget makes "
+                    "the search much harder even when a valid solution exists\n"
+                )
+            _msg += (
+                "- Reduce the number of candidate shifts (narrow duration range or "
+                "increase the granularity)\n"
+                "- Widen weekly-hour limits or reduce minimum rest hours"
+            )
+        else:  # INFEASIBLE
+            _msg = (
+                f"**Solver status: {cp1.status}**  (solved in {cp1.elapsed_sec:.1f}s)\n\n"
+                "The model has **no feasible solution** with the current settings. "
+                "Try relaxing one or more constraints:\n"
+                "- Widen the shift-duration range (lower min / raise max)\n"
+                "- Reduce minimum weekly hours or raise maximum weekly hours\n"
+                "- Lower minimum rest hours between shifts\n"
+                "- Remove or loosen entry / exit / headcount limits\n"
+                "- Uncheck *Exclude night shifts* if demand peaks at night\n"
+            )
+            if _has_budget:
+                _msg += (
+                    "- **Raise the budget cap** — the demand cannot be covered "
+                    "within the specified cost limit\n"
+                )
+        st.error(_msg)
         st.stop()
 
     st.header("📊 Results")
