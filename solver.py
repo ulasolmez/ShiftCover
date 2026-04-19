@@ -306,9 +306,9 @@ class _ProgressCallback(cp_model.CpSolverSolutionCallback):
         self._time_limit = max(float(time_limit_sec), 1.0)
 
     def on_solution_callback(self) -> None:
-        elapsed = self.wall_time()
-        obj     = self.objective_value()
-        bound   = self.best_objective_bound()
+        elapsed = self.wall_time
+        obj     = self.objective_value
+        bound   = self.best_objective_bound
         gap     = abs(obj - bound) / (abs(obj) + 1e-9) * 100.0
         frac    = (self._SOLVE_START
                    + min(elapsed / self._time_limit, 1.0)
