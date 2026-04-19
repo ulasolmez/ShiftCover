@@ -26,6 +26,20 @@ from sample_data import generate_sample_demand
 st.set_page_config(page_title="ShiftCover", layout="wide")
 st.title("🕐 ShiftCover – Weekly Shift Optimiser")
 
+st.markdown("""
+<style>
+/* Sticky Run Optimiser button – floats at top of main area while scrolling */
+[data-testid="stMainBlockContainer"] .stButton:has(button[data-testid="baseButton-primary"]) {
+    position: sticky;
+    top: 3rem;
+    z-index: 100;
+    background-color: var(--background-color, #0e1117);
+    padding: 4px 0 6px 0;
+    border-bottom: 1px solid rgba(250,250,250,0.1);
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Parameters")
@@ -38,34 +52,34 @@ with st.sidebar:
                              value=default_name, key=f"occ_name_{i}")
         occ_names.append(name)
 
-    st.subheader("Shift settings")
-    min_shift = st.slider("Min shift (h)", 3.0, 8.0, 3.0, 0.5)
-    max_shift = st.slider("Max shift (h)", 6.0, 12.0, 12.0, 0.5)
-    max_unique = st.number_input("Max unique shifts (0 = unlimited)", 0, 200, 0)
-    no_night = st.checkbox("Exclude night shifts (≥8 h with >50 % in 20:00–06:00)", value=False)
-    circular = st.checkbox("Circular week (Sunday → Monday)", value=False)
+    with st.expander("⚙ Shift settings", expanded=True):
+        min_shift = st.slider("Min shift (h)", 3.0, 8.0, 3.0, 0.5)
+        max_shift = st.slider("Max shift (h)", 6.0, 12.0, 12.0, 0.5)
+        max_unique = st.number_input("Max unique shifts (0 = unlimited)", 0, 200, 0)
+        no_night = st.checkbox("Exclude night shifts (≥8 h with >50 % in 20:00–06:00)", value=False)
+        circular = st.checkbox("Circular week (Sunday → Monday)", value=False)
 
-    _ALL_SLOTS = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
-    _HOURLY_SLOTS = [f"{h:02d}:00" for h in range(24)]
-    if "slot_filter" not in st.session_state:
-        st.session_state["slot_filter"] = _ALL_SLOTS[:]
-    st.caption("Allowed start & end times")
-    _sc1, _sc2 = st.columns(2)
-    if _sc1.button("All times", key="slots_all_btn"):
-        st.session_state["slot_filter"] = _ALL_SLOTS[:]
-        st.rerun()
-    if _sc2.button("Every hour", key="slots_hourly_btn"):
-        st.session_state["slot_filter"] = _HOURLY_SLOTS[:]
-        st.rerun()
-    allowed_slots_sel = st.multiselect(
-        "Allowed times (start & end)",
-        options=_ALL_SLOTS,
-        key="slot_filter",
-    )
-    allowed_slot_minutes = (
-        [int(t[:2]) * 60 + int(t[3:]) for t in allowed_slots_sel]
-        if len(allowed_slots_sel) < 48 else None
-    )
+        _ALL_SLOTS = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
+        _HOURLY_SLOTS = [f"{h:02d}:00" for h in range(24)]
+        if "slot_filter" not in st.session_state:
+            st.session_state["slot_filter"] = _ALL_SLOTS[:]
+        st.caption("Allowed start & end times")
+        _sc1, _sc2 = st.columns(2)
+        if _sc1.button("All times", key="slots_all_btn"):
+            st.session_state["slot_filter"] = _ALL_SLOTS[:]
+            st.rerun()
+        if _sc2.button("Every hour", key="slots_hourly_btn"):
+            st.session_state["slot_filter"] = _HOURLY_SLOTS[:]
+            st.rerun()
+        allowed_slots_sel = st.multiselect(
+            "Allowed times (start & end)",
+            options=_ALL_SLOTS,
+            key="slot_filter",
+        )
+        allowed_slot_minutes = (
+            [int(t[:2]) * 60 + int(t[3:]) for t in allowed_slots_sel]
+            if len(allowed_slots_sel) < 48 else None
+        )
 
     # Build list of possible shift codes based on current settings
     _preview_params = SolverParams(
@@ -76,78 +90,76 @@ with st.sidebar:
     )
     _all_codes = list_possible_shift_codes(_preview_params)
 
-    st.subheader("Force include / exclude shifts")
-    st.caption(f"{len(_all_codes)} possible shift patterns")
-    st.markdown("""<style>
-    div:has(> .green-ms) + div [data-baseweb="tag"] {
-        background-color: #2e7d32 !important; color: white !important;
-    }
-    div:has(> .green-ms) + div [data-baseweb="tag"] span,
-    div:has(> .green-ms) + div [data-baseweb="tag"] svg {
-        color: white !important; fill: white !important;
-    }
-    div:has(> .red-ms) + div [data-baseweb="tag"] {
-        background-color: #c62828 !important; color: white !important;
-    }
-    div:has(> .red-ms) + div [data-baseweb="tag"] span,
-    div:has(> .red-ms) + div [data-baseweb="tag"] svg {
-        color: white !important; fill: white !important;
-    }
-    </style>""", unsafe_allow_html=True)
-    st.markdown('<span class="green-ms"></span>', unsafe_allow_html=True)
-    force_incl = st.multiselect(
-        "Must include (solver will always use these)",
-        options=_all_codes, default=[], key="force_incl")
-    # Remove already-included codes from exclude options
-    _excl_options = [c for c in _all_codes if c not in set(force_incl)]
-    st.markdown('<span class="red-ms"></span>', unsafe_allow_html=True)
-    force_excl = st.multiselect(
-        "Must exclude (solver will never use these)",
-        options=_excl_options, default=[], key="force_excl")
-    # Warn if conflict (should not happen due to filtering, but guard)
-    _conflict = set(force_incl) & set(force_excl)
-    if _conflict:
-        st.warning(f"Conflict: {', '.join(sorted(_conflict))} in both lists")
+    with st.expander(f"✅ Force include / exclude  ({len(_all_codes)} patterns)", expanded=False):
+        st.markdown("""<style>
+        div:has(> .green-ms) + div [data-baseweb="tag"] {
+            background-color: #2e7d32 !important; color: white !important;
+        }
+        div:has(> .green-ms) + div [data-baseweb="tag"] span,
+        div:has(> .green-ms) + div [data-baseweb="tag"] svg {
+            color: white !important; fill: white !important;
+        }
+        div:has(> .red-ms) + div [data-baseweb="tag"] {
+            background-color: #c62828 !important; color: white !important;
+        }
+        div:has(> .red-ms) + div [data-baseweb="tag"] span,
+        div:has(> .red-ms) + div [data-baseweb="tag"] svg {
+            color: white !important; fill: white !important;
+        }
+        </style>""", unsafe_allow_html=True)
+        st.markdown('<span class="green-ms"></span>', unsafe_allow_html=True)
+        force_incl = st.multiselect(
+            "Must include (solver will always use these)",
+            options=_all_codes, default=[], key="force_incl")
+        _excl_options = [c for c in _all_codes if c not in set(force_incl)]
+        st.markdown('<span class="red-ms"></span>', unsafe_allow_html=True)
+        force_excl = st.multiselect(
+            "Must exclude (solver will never use these)",
+            options=_excl_options, default=[], key="force_excl")
+        _conflict = set(force_incl) & set(force_excl)
+        if _conflict:
+            st.warning(f"Conflict: {', '.join(sorted(_conflict))} in both lists")
 
-    st.subheader("Weekly hours")
-    min_wh = st.number_input("Min weekly hours", 20.0, 60.0, 40.0, 1.0)
-    max_wh = st.number_input("Max weekly hours", 20.0, 60.0, 50.0, 1.0)
+    with st.expander("🕐 Weekly hours", expanded=False):
+        min_wh = st.number_input("Min weekly hours", 20.0, 60.0, 40.0, 1.0)
+        max_wh = st.number_input("Max weekly hours", 20.0, 60.0, 50.0, 1.0)
 
-    st.subheader("Worker constraints")
-    min_rest = st.number_input("Min rest between shifts (h)", 8.0, 24.0, 12.0, 1.0)
+    with st.expander("👤 Worker constraints", expanded=False):
+        min_rest = st.number_input("Min rest between shifts (h)", 8.0, 24.0, 12.0, 1.0)
 
-    st.subheader("Entry / Exit limits per day")
-    st.caption("Max distinct start times (entries) and end times (exits) "
-               "per day. 0 = unlimited.")
     DAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    max_entries = []
-    max_exits = []
-    for d in range(7):
-        col_e, col_x = st.columns(2)
-        with col_e:
-            e = st.number_input(f"{DAY_SHORT[d]} entries",
-                                0, 48, 0, key=f"ent_{d}")
-            max_entries.append(e)
-        with col_x:
-            x = st.number_input(f"{DAY_SHORT[d]} exits",
-                                0, 48, 0, key=f"ext_{d}")
-            max_exits.append(x)
+
+    with st.expander("📅 Entry / Exit limits per day", expanded=False):
+        st.caption("Max distinct start times (entries) and end times (exits) "
+                   "per day. 0 = unlimited.")
+        max_entries = []
+        max_exits = []
+        for d in range(7):
+            col_e, col_x = st.columns(2)
+            with col_e:
+                e = st.number_input(f"{DAY_SHORT[d]} entries",
+                                    0, 48, 0, key=f"ent_{d}")
+                max_entries.append(e)
+            with col_x:
+                x = st.number_input(f"{DAY_SHORT[d]} exits",
+                                    0, 48, 0, key=f"ext_{d}")
+                max_exits.append(x)
     use_entries = any(v > 0 for v in max_entries)
     use_exits = any(v > 0 for v in max_exits)
 
-    st.subheader("Max headcount per day")
-    st.caption("Max simultaneous workers (all occupations) per day. "
-               "0 = unlimited.")
-    max_hc = []
-    for d in range(7):
-        h = st.number_input(f"{DAY_SHORT[d]} max headcount",
-                            0, 500, 0, key=f"hc_{d}")
-        max_hc.append(h)
+    with st.expander("👥 Max headcount per day", expanded=False):
+        st.caption("Max simultaneous workers (all occupations) per day. "
+                   "0 = unlimited.")
+        max_hc = []
+        for d in range(7):
+            h = st.number_input(f"{DAY_SHORT[d]} max headcount",
+                                0, 500, 0, key=f"hc_{d}")
+            max_hc.append(h)
     use_hc = any(v > 0 for v in max_hc)
 
-    st.subheader("Solver")
-    time_limit = st.number_input("Time limit (s)", 10, 600, 120, 10)
-    t_penalty = st.number_input("Transition penalty", 0, 500, 50, 10)
+    with st.expander("🔧 Solver", expanded=False):
+        time_limit = st.number_input("Time limit (s)", 10, 600, 120, 10)
+        t_penalty = st.number_input("Transition penalty", 0, 500, 50, 10)
 
 params = SolverParams(
     min_shift_hours=min_shift,
