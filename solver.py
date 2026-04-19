@@ -293,8 +293,33 @@ def build_coverage_map(
     return cov
 
 
-# ── Phase 1 – Multi-Curve Set Covering ───────────────────────────────────────
-def solve_phase1_multi(
+class _ProgressCallback(cp_model.CpSolverSolutionCallback):
+    """Relay each new CP-SAT incumbent to the user callback as a progress dict."""
+
+    # Solving phase occupies progress 0.40 → 0.95
+    _SOLVE_START = 0.40
+    _SOLVE_END   = 0.95
+
+    def __init__(self, user_cb, time_limit_sec: float):
+        super().__init__()
+        self._user_cb = user_cb
+        self._time_limit = max(float(time_limit_sec), 1.0)
+
+    def on_solution_callback(self) -> None:
+        elapsed = self.wall_time()
+        obj     = self.objective_value()
+        bound   = self.best_objective_bound()
+        gap     = abs(obj - bound) / (abs(obj) + 1e-9) * 100.0
+        frac    = (self._SOLVE_START
+                   + min(elapsed / self._time_limit, 1.0)
+                   * (self._SOLVE_END - self._SOLVE_START))
+        self._user_cb({
+            "type":      "solution",
+            "elapsed":   elapsed,
+            "objective": int(obj),
+            "gap_pct":   gap,
+            "progress":  min(frac, self._SOLVE_END),
+        })
     demands: List[np.ndarray],
     occ_names: List[str],
     params: SolverParams,
@@ -471,7 +496,8 @@ def solve_phase1_multi(
     solver.parameters.num_workers = 8
     solver.parameters.log_search_progress = False
 
-    status_code = solver.solve(model)
+    _sol_cb = _ProgressCallback(callback, params.solver_time_limit_sec) if callback else None
+    status_code = solver.solve(model, _sol_cb)
     status_str  = solver.status_name(status_code)
     elapsed     = time.time() - t0
 

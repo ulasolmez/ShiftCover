@@ -363,15 +363,55 @@ if demands is not None:
         st.warning(w)
 
     if st.button("▶ Run Optimiser", type="primary"):
-        log_box = st.empty()
-        log_lines: list[str] = []
+        _progress_bar  = st.progress(0.0, text="Preparing…")
+        _status_text   = st.empty()
+        _log_lines: list[str] = []
+        with st.expander("Solver log", expanded=False):
+            _log_box = st.empty()
+
+        # Stage name prefix → progress fraction (pre-solve phases)
+        _STAGE_FRAC = {
+            "Generated":              0.08,
+            "Built coverage map":     0.15,
+            "Force-include":          0.18,
+            "Max unique shifts":      0.20,
+            "Max entries":            0.22,
+            "Max exits":              0.24,
+            "Max headcount":          0.26,
+            "Coverage constraints":   0.35,
+            "Transition penalty":     0.38,
+            "Model built":            0.40,
+            "Phase 1 done":           1.00,
+        }
 
         def _cb(msg):
-            log_lines.append(msg)
-            log_box.code("\n".join(log_lines), language="text")
+            if isinstance(msg, dict) and msg.get("type") == "solution":
+                frac    = msg["progress"]
+                elapsed = msg["elapsed"]
+                obj     = msg["objective"]
+                gap     = msg["gap_pct"]
+                _progress_bar.progress(
+                    frac,
+                    text=f"Solving… {elapsed:.0f}s · obj={obj:,} · gap={gap:.1f}%",
+                )
+                _status_text.info(
+                    f"Best solution: **{obj:,}** worker-intervals "
+                    f"| gap {gap:.1f}% | {elapsed:.0f}s elapsed"
+                )
+            else:
+                text = str(msg)
+                frac = next(
+                    (v for k, v in _STAGE_FRAC.items() if text.startswith(k)),
+                    None,
+                )
+                if frac is not None:
+                    _progress_bar.progress(frac, text=text)
+                _log_lines.append(text)
+                _log_box.code("\n".join(_log_lines), language="text")
 
-        with st.spinner("Solving …"):
-            result = solve_multi(demands, stored_names, params, callback=_cb)
+        result = solve_multi(demands, stored_names, params, callback=_cb)
+        _progress_bar.progress(1.0, text="Done!")
+        _status_text.empty()
 
         # stash previous before overwriting
         if "result" in st.session_state:
