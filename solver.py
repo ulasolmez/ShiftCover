@@ -320,6 +320,10 @@ class _ProgressCallback(cp_model.CpSolverSolutionCallback):
             "gap_pct":   gap,
             "progress":  min(frac, self._SOLVE_END),
         })
+
+
+# ── Phase 1 – Multi-Curve Set Covering ───────────────────────────────────────
+def solve_phase1_multi(
     demands: List[np.ndarray],
     occ_names: List[str],
     params: SolverParams,
