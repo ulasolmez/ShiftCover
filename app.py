@@ -44,11 +44,34 @@ with st.sidebar:
     no_night = st.checkbox("Exclude night shifts (≥8 h with >50 % in 20:00–06:00)", value=False)
     circular = st.checkbox("Circular week (Sunday → Monday)", value=False)
 
+    _ALL_SLOTS = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
+    _HOURLY_SLOTS = [f"{h:02d}:00" for h in range(24)]
+    if "slot_filter" not in st.session_state:
+        st.session_state["slot_filter"] = _ALL_SLOTS[:]
+    st.caption("Allowed start & end times")
+    _sc1, _sc2 = st.columns(2)
+    if _sc1.button("All times", key="slots_all_btn"):
+        st.session_state["slot_filter"] = _ALL_SLOTS[:]
+        st.rerun()
+    if _sc2.button("Every hour", key="slots_hourly_btn"):
+        st.session_state["slot_filter"] = _HOURLY_SLOTS[:]
+        st.rerun()
+    allowed_slots_sel = st.multiselect(
+        "Allowed times (start & end)",
+        options=_ALL_SLOTS,
+        key="slot_filter",
+    )
+    allowed_slot_minutes = (
+        [int(t[:2]) * 60 + int(t[3:]) for t in allowed_slots_sel]
+        if len(allowed_slots_sel) < 48 else None
+    )
+
     # Build list of possible shift codes based on current settings
     _preview_params = SolverParams(
         min_shift_hours=min_shift, max_shift_hours=max_shift,
         shift_start_granularity_min=30, shift_duration_step_min=30,
         exclude_night_shifts=no_night,
+        allowed_slot_minutes=allowed_slot_minutes,
     )
     _all_codes = list_possible_shift_codes(_preview_params)
 
@@ -143,6 +166,7 @@ params = SolverParams(
     circular_week=circular,
     force_include_shifts=force_incl if force_incl else None,
     force_exclude_shifts=force_excl if force_excl else None,
+    allowed_slot_minutes=allowed_slot_minutes,
 )
 
 

@@ -111,6 +111,10 @@ class SolverParams:
     # Force include/exclude specific shift codes (e.g. ["0630-1430"])
     force_include_shifts: Optional[List[str]] = None
     force_exclude_shifts: Optional[List[str]] = None
+    # Allowed start/end minutes-of-day (e.g. [0, 60, 120, ...] for every hour).
+    # Shifts are only generated when BOTH start and end fall in this set.
+    # None = all times allowed.
+    allowed_slot_minutes: Optional[List[int]] = None
 
 
 @dataclass
@@ -221,11 +225,17 @@ def list_possible_shift_codes(params: SolverParams) -> List[str]:
     dur_step   = max(1, params.shift_duration_step_min // 5)
     min_dur    = int(params.min_shift_hours * INTERVALS_PER_HOUR)
     max_dur    = int(params.max_shift_hours * INTERVALS_PER_HOUR)
+    _allowed_mins = set(params.allowed_slot_minutes) if params.allowed_slot_minutes is not None else None
     codes: set = set()
     for start in range(0, INTERVALS_PER_DAY, start_step):
         for dur in range(min_dur, max_dur + 1, dur_step):
             if params.exclude_night_shifts and is_night_shift(start, dur):
                 continue
+            if _allowed_mins is not None:
+                if (start * 5) % 1440 not in _allowed_mins:
+                    continue
+                if ((start + dur) * 5) % 1440 not in _allowed_mins:
+                    continue
             codes.add(_shift_code_from(start, dur))
     return sorted(codes)
 
@@ -237,6 +247,7 @@ def generate_candidate_shifts(params: SolverParams) -> List[CandidateShift]:
     max_dur    = int(params.max_shift_hours * INTERVALS_PER_HOUR)
 
     _excl_set = set(params.force_exclude_shifts) if params.force_exclude_shifts else set()
+    _allowed_mins = set(params.allowed_slot_minutes) if params.allowed_slot_minutes is not None else None
 
     shifts: List[CandidateShift] = []
     idx = 0
@@ -260,6 +271,12 @@ def generate_candidate_shifts(params: SolverParams) -> List[CandidateShift]:
                         and _shift_code_from(start, dur)
                         in _excl_set):
                     continue
+
+                if _allowed_mins is not None:
+                    if (start * 5) % 1440 not in _allowed_mins:
+                        continue
+                    if ((start + dur) * 5) % 1440 not in _allowed_mins:
+                        continue
 
                 shifts.append(CandidateShift(idx, day, start, dur))
                 idx += 1
