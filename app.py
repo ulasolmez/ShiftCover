@@ -5,6 +5,7 @@ Supports 1-3 occupation workload curves with shared shift structures.
 """
 
 import io
+import dataclasses
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -372,6 +373,10 @@ if demands is not None:
         with st.spinner("Solving …"):
             result = solve_multi(demands, stored_names, params, callback=_cb)
 
+        # stash previous before overwriting
+        if "result" in st.session_state:
+            st.session_state["prev_result"] = st.session_state["result"]
+            st.session_state["prev_result_params"] = st.session_state.get("result_params")
         st.session_state["result"] = result
         st.session_state["result_params"] = params
 
@@ -446,6 +451,83 @@ if result is not None:
             f"({_gap_wh:.1f} worker-hours) remain below demand. "
             f"Peak deficit: **{_max_deficit}** workers."
         )
+
+    # ── What changed vs previous solve ──────────────────────────────────
+    _prev_result: MultiCurveResult | None = st.session_state.get("prev_result")
+    _prev_params: SolverParams | None = st.session_state.get("prev_result_params")
+    _cur_params: SolverParams | None = st.session_state.get("result_params")
+    if (_prev_result is not None
+            and _prev_result.combined_phase1.status in ("OPTIMAL", "FEASIBLE")):
+        with st.expander("🔄 What changed vs previous solve", expanded=True):
+            _pcp1 = _prev_result.combined_phase1
+
+            # --- param diff ---
+            _param_rows = []
+            if _prev_params is not None and _cur_params is not None:
+                for _f in dataclasses.fields(SolverParams):
+                    _ov = getattr(_prev_params, _f.name)
+                    _nv = getattr(_cur_params, _f.name)
+                    if _ov != _nv:
+                        _param_rows.append({"Parameter": _f.name,
+                                            "Previous": _ov, "Now": _nv})
+            if _param_rows:
+                st.caption("**Settings changed:**")
+                st.dataframe(pd.DataFrame(_param_rows),
+                             use_container_width=True, hide_index=True)
+            else:
+                st.caption("Settings unchanged.")
+
+            # --- metric deltas ---
+            _prev_wh = _pcp1.total_worker_intervals / INTERVALS_PER_HOUR
+            _prev_active = sum(1 for c in _pcp1.counts if c > 0)
+            _prev_hc = max_headcount(_pcp1)
+            _prev_peak_sim = int(_pcp1.coverage.max())
+            _prev_deficit_arr = np.maximum(
+                _prev_result.combined_demand - _pcp1.coverage, 0)
+            _prev_gap_wh = float(_prev_deficit_arr.sum()) / INTERVALS_PER_HOUR
+            _prev_di = int(np.count_nonzero(_prev_deficit_arr))
+            _prev_tid = int(np.count_nonzero(_prev_result.combined_demand))
+            _prev_pct = (100.0 * (1 - _prev_di / _prev_tid)
+                         if _prev_tid > 0 else 100.0)
+
+            st.caption("**Metrics:**")
+            _dc1, _dc2, _dc3, _dc4, _dc5 = st.columns(5)
+            _dc1.metric("Active shifts", n_active,
+                        delta=n_active - _prev_active)
+            _dc2.metric("Worker-hours", f"{total_wh:,.0f}",
+                        delta=f"{total_wh - _prev_wh:+,.0f}")
+            _dc3.metric("Headcount", total_headcount,
+                        delta=total_headcount - _prev_hc,
+                        delta_color="inverse")
+            _dc4.metric("Coverage", f"{_pct_covered:.1f} %",
+                        delta=f"{_pct_covered - _prev_pct:+.1f} %")
+            _dc5.metric("Under-cov (wh)", f"{_gap_wh:.1f}",
+                        delta=f"{_gap_wh - _prev_gap_wh:+.1f}",
+                        delta_color="inverse")
+
+            # --- shifts added / removed ---
+            _prev_codes: set[str] = set()
+            for _occ in _prev_result.occupations:
+                for _s, _cnt in zip(_occ.phase1.shifts, _occ.phase1.counts):
+                    if _cnt > 0:
+                        _prev_codes.add(_s.shift_code)
+            _cur_codes: set[str] = set()
+            for _occ in result.occupations:
+                for _s, _cnt in zip(_occ.phase1.shifts, _occ.phase1.counts):
+                    if _cnt > 0:
+                        _cur_codes.add(_s.shift_code)
+            _added = sorted(_cur_codes - _prev_codes)
+            _removed = sorted(_prev_codes - _cur_codes)
+            if _added or _removed:
+                _ch1, _ch2 = st.columns(2)
+                if _added:
+                    _ch1.caption(f"**Shifts added ({len(_added)}):**")
+                    _ch1.write(", ".join(_added))
+                if _removed:
+                    _ch2.caption(f"**Shifts removed ({len(_removed)}):**")
+                    _ch2.write(", ".join(_removed))
+            else:
+                st.caption("No shift types added or removed.")
 
     # per-occupation headcount
     if n_occ > 1:
