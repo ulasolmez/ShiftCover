@@ -34,21 +34,35 @@ def generate_sample_demand(
         offset = day * INTERVALS_PER_DAY
         x = np.arange(INTERVALS_PER_DAY, dtype=float)
 
+        # Per-day randomised peak height and timing jitter
+        day_scale = rng.uniform(0.7, 1.3)
+        jitter = rng.integers(-18, 19)  # ±90 min shift of peaks
+
         if day < 5:  # weekday
+            # Randomise number of peaks: occasionally add a third
+            n_peaks = rng.choice([2, 2, 3], p=[0.4, 0.4, 0.2])
             curve = (
-                _bell(x, 108, 30, peak_agents * 0.7) +       # 09:00 peak
-                _bell(x, 168, 25, peak_agents) +              # 14:00 peak
-                _bell(x, 204, 35, peak_agents * 0.55) +       # 17:00 tail
+                _bell(x, 108 + jitter, rng.uniform(20, 40), peak_agents * rng.uniform(0.5, 0.9)) +
+                _bell(x, 168 + jitter, rng.uniform(18, 32), peak_agents * day_scale) +
                 base_agents
             )
+            if n_peaks == 3:
+                curve += _bell(x, rng.integers(216, 252), rng.uniform(15, 28),
+                               peak_agents * rng.uniform(0.3, 0.6))
         else:  # weekend
             curve = (
-                _bell(x, 144, 40, peak_agents * 0.45) +       # noon peak
-                base_agents * 0.6
+                _bell(x, 144 + jitter, rng.uniform(28, 52), peak_agents * rng.uniform(0.3, 0.65)) +
+                base_agents * rng.uniform(0.4, 0.9)
             )
 
-        # add a little noise
-        curve += rng.normal(0, 0.8, INTERVALS_PER_DAY)
+        # Multi-scale noise: slow drift + fast spikes
+        slow_noise = np.interp(
+            x,
+            np.linspace(0, INTERVALS_PER_DAY - 1, 12),
+            rng.normal(0, peak_agents * 0.12, 12),
+        )
+        fast_noise = rng.normal(0, peak_agents * 0.06, INTERVALS_PER_DAY)
+        curve += slow_noise + fast_noise
         curve = np.clip(curve, 0, None)
         demand[offset:offset + INTERVALS_PER_DAY] = curve
 
