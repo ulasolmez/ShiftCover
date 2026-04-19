@@ -123,13 +123,17 @@ class PhaseOneResult:
     elapsed_sec: float
 
 
-@dataclass
-class PhaseTwoResult:
-    worker_schedules: List[List[CandidateShift]]
-    worker_hours: List[float]
-    num_workers: int
-    status: str
-    elapsed_sec: float
+def daily_entry_headcount(p1: PhaseOneResult) -> List[int]:
+    """Workers entering per day = sum of shift counts whose start day == d."""
+    daily = [0] * 7
+    for s, cnt in zip(p1.shifts, p1.counts):
+        daily[s.day] += cnt
+    return daily
+
+
+def max_headcount(p1: PhaseOneResult) -> int:
+    """Peak single-day headcount across the week."""
+    return max(daily_entry_headcount(p1))
 
 
 @dataclass
@@ -137,7 +141,6 @@ class OccupationResult:
     name: str
     demand: np.ndarray
     phase1: PhaseOneResult
-    phase2: PhaseTwoResult
 
 
 @dataclass
@@ -499,148 +502,6 @@ def solve_phase1_multi(
     return per_occ, combined_p1
 
 
-# ── Phase 2 – Worker Assignment (greedy with rest constraint) ────────────────
-def _shift_ranges(s: CandidateShift):
-    """Return list of (start, end) interval ranges, handling week wrap."""
-    if s.global_end <= TOTAL_INTERVALS:
-        return [(s.global_start, s.global_end)]
-    return [(s.global_start, TOTAL_INTERVALS),
-            (0, s.global_end - TOTAL_INTERVALS)]
-
-
-def _can_assign(
-    worker_shifts: List[CandidateShift],
-    shift: CandidateShift,
-    params: SolverParams,
-) -> bool:
-    rest_ivl = int(params.min_rest_hours * INTERVALS_PER_HOUR)
-    max_ivl  = int(params.max_weekly_hours * INTERVALS_PER_HOUR)
-
-    current = sum(s.duration_intervals for s in worker_shifts)
-    if current + shift.duration_intervals > max_ivl:
-        return False
-
-    # one shift per calendar day (based on start day only)
-    for ex in worker_shifts:
-        if ex.day == shift.day:
-            return False
-
-    s_ranges = _shift_ranges(shift)
-
-    for ex in worker_shifts:
-        ex_ranges = _shift_ranges(ex)
-
-        # overlap check (compare all range pairs)
-        overlap = False
-        for (a1, a2) in s_ranges:
-            for (b1, b2) in ex_ranges:
-                if not (a2 <= b1 or b2 <= a1):
-                    overlap = True
-                    break
-            if overlap:
-                break
-        if overlap:
-            return False
-
-        # rest gap check
-        has_wrap = (shift.global_end > TOTAL_INTERVALS or
-                    ex.global_end > TOTAL_INTERVALS)
-        if has_wrap:
-            # circular gap: effective ends wrapped
-            e_ex = (ex.global_end % TOTAL_INTERVALS
-                    if ex.global_end > TOTAL_INTERVALS
-                    else ex.global_end)
-            e_sh = (shift.global_end % TOTAL_INTERVALS
-                    if shift.global_end > TOTAL_INTERVALS
-                    else shift.global_end)
-            gap = min((shift.global_start - e_ex) % TOTAL_INTERVALS,
-                      (ex.global_start - e_sh) % TOTAL_INTERVALS)
-        else:
-            if ex.global_end <= shift.global_start:
-                gap = shift.global_start - ex.global_end
-            else:
-                gap = ex.global_start - shift.global_end
-        if gap < rest_ivl:
-            return False
-    return True
-
-
-def solve_phase2(
-    p1: PhaseOneResult,
-    params: SolverParams,
-    callback=None,
-) -> PhaseTwoResult:
-    t0 = time.time()
-
-    instances: List[CandidateShift] = []
-    for s, cnt in zip(p1.shifts, p1.counts):
-        for _ in range(cnt):
-            instances.append(s)
-
-    if not instances:
-        return PhaseTwoResult([], [], 0, "NO_SHIFTS", 0.0)
-
-    instances.sort(key=lambda s: (s.global_start, s.duration_intervals))
-
-    workers: List[List[CandidateShift]] = []
-    worker_totals: List[int] = []
-    max_ivl = int(params.max_weekly_hours * INTERVALS_PER_HOUR)
-    min_ivl = int(params.min_weekly_hours * INTERVALS_PER_HOUR)
-
-    for j, shift in enumerate(instances):
-        best_w    = -1
-        best_score = None
-
-        for w_idx, (w_shifts, w_total) in enumerate(
-                zip(workers, worker_totals)):
-            new_total = w_total + shift.duration_intervals
-            if new_total > max_ivl:
-                continue
-            if not _can_assign(w_shifts, shift, params):
-                continue
-            if w_total < min_ivl:          # tier 0 – fill under-min first
-                tier, sec = 0, -w_total
-            else:                          # tier 1 – most remaining capacity
-                tier, sec = 1, -(max_ivl - new_total)
-            score = (tier, sec)
-            if best_score is None or score < best_score:
-                best_w, best_score = w_idx, score
-
-        if best_w >= 0:
-            workers[best_w].append(shift)
-            worker_totals[best_w] += shift.duration_intervals
-        else:
-            workers.append([shift])
-            worker_totals.append(shift.duration_intervals)
-
-        if callback and (j + 1) % 200 == 0:
-            callback(f"  … {j+1}/{len(instances)} shifts, "
-                     f"{len(workers)} workers")
-
-    under_min = 0
-    schedules: List[List[CandidateShift]] = []
-    hours_list: List[float] = []
-    for ws, wt in zip(workers, worker_totals):
-        ws.sort(key=lambda s: s.global_start)
-        schedules.append(ws)
-        hrs = wt / INTERVALS_PER_HOUR
-        hours_list.append(hrs)
-        if wt < min_ivl:
-            under_min += 1
-
-    status = "FEASIBLE"
-    if under_min > 0:
-        status = f"FEASIBLE ({under_min} below min hours)"
-
-    elapsed = time.time() - t0
-    if callback:
-        callback(f"  Phase 2: {len(schedules)} workers, "
-                 f"status={status}, {elapsed:.1f}s")
-
-    return PhaseTwoResult(schedules, hours_list, len(schedules),
-                          status, elapsed)
-
-
 # ── Convenience entry points ─────────────────────────────────────────────────
 def solve_multi(
     demands: List[np.ndarray],
@@ -654,23 +515,10 @@ def solve_multi(
     per_occ_p1, combined_p1 = solve_phase1_multi(
         demands, occ_names, params, callback)
 
-    if combined_p1.status not in ("OPTIMAL", "FEASIBLE"):
-        occ_results = [
-            OccupationResult(n, d, p,
-                             PhaseTwoResult([], [], 0, "SKIPPED", 0.0))
-            for n, d, p in zip(occ_names, demands, per_occ_p1)
-        ]
-        return MultiCurveResult(occ_results, combined_p1,
-                                sum(demands), params)
-
-    occ_results = []
-    for i, name in enumerate(occ_names):
-        if callback:
-            callback(f"Phase 2 for {name} …")
-        p2 = solve_phase2(per_occ_p1[i], params, callback)
-        occ_results.append(OccupationResult(name, demands[i],
-                                            per_occ_p1[i], p2))
-
+    occ_results = [
+        OccupationResult(n, d, p)
+        for n, d, p in zip(occ_names, demands, per_occ_p1)
+    ]
     return MultiCurveResult(occ_results, combined_p1,
                             sum(demands), params)
 
@@ -703,34 +551,6 @@ def shifts_to_dataframe(p1: PhaseOneResult, label: str = "") -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if not df.empty:
         df.sort_values(["DayNum", "Start"], inplace=True)
-        df.reset_index(drop=True, inplace=True)
-    return df
-
-
-def schedules_to_dataframe(
-    p2: PhaseTwoResult,
-    label: str = "",
-    emp_offset: int = 0,
-) -> pd.DataFrame:
-    rows = []
-    for w_idx, (sched, hrs) in enumerate(
-            zip(p2.worker_schedules, p2.worker_hours)):
-        for s in sched:
-            row = {
-                "Worker": w_idx + 1 + emp_offset,
-                "Day": DAY_NAMES[s.day],
-                "DayNum": s.day,
-                "Start": s.start_time_str,
-                "End": s.end_time_str,
-                "DurationHrs": s.duration_hours,
-                "WeeklyHrs": hrs,
-            }
-            if label:
-                row["Occupation"] = label
-            rows.append(row)
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df.sort_values(["Worker", "DayNum", "Start"], inplace=True)
         df.reset_index(drop=True, inplace=True)
     return df
 
@@ -844,50 +664,6 @@ def shift_type_summary(
 def build_weekly_report_xlsx(result: MultiCurveResult) -> bytes:
     buf = _io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-
-        # ── Roster ───────────────────────────────────────────────────────
-        all_roster = []
-        all_summary = []
-        for occ in result.occupations:
-            pfx = occ.name[:3].upper()
-            for w_idx, (sched, hrs) in enumerate(
-                    zip(occ.phase2.worker_schedules,
-                        occ.phase2.worker_hours)):
-                emp = f"{pfx}-{w_idx+1:03d}"
-                for s in sched:
-                    all_roster.append({
-                        "Occupation": occ.name,
-                        "Worker": emp,
-                        "Day": DAY_NAMES[s.day],
-                        "Shift": s.shift_code,
-                        "Start": s.start_time_str,
-                        "End": s.end_time_str,
-                        "Hours": s.duration_hours,
-                    })
-                row: Dict = {
-                    "Occupation": occ.name,
-                    "Worker": emp,
-                    "TotalHours": round(hrs, 1),
-                    "FTE(÷45)": round(hrs / 45.0, 2),
-                    "Shifts": len(sched),
-                }
-                for d in range(7):
-                    day_s = [s for s in sched if s.day == d]
-                    row[DAY_NAMES[d]] = (
-                        ", ".join(s.shift_code for s in day_s)
-                        if day_s else "OFF")
-                all_summary.append(row)
-
-        pd.DataFrame(all_roster).to_excel(writer, sheet_name="Roster",
-                                          index=False)
-        sdf = pd.DataFrame(all_summary)
-        sdf.to_excel(writer, sheet_name="Worker Summary", index=False)
-        if not sdf.empty:
-            ws = writer.sheets["Worker Summary"]
-            for i, col in enumerate(sdf.columns):
-                mx = max(sdf[col].astype(str).str.len().max(),
-                         len(col)) + 2
-                ws.set_column(i, i, mx)
 
         # ── Shift Types ──────────────────────────────────────────────────
         all_st = [shift_type_summary(o.phase1, o.name)

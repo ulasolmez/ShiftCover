@@ -15,8 +15,9 @@ from solver import (
     DAY_NAMES, OCC_COLORS,
     SolverParams, MultiCurveResult,
     solve_multi, list_possible_shift_codes,
-    coverage_dataframe, shifts_to_dataframe, schedules_to_dataframe,
+    coverage_dataframe, shifts_to_dataframe,
     shift_type_summary, build_weekly_report_xlsx,
+    daily_entry_headcount, max_headcount,
 )
 from sample_data import generate_sample_demand
 
@@ -381,7 +382,7 @@ if result is not None:
 
     # ── Phase 1 summary metrics ──────────────────────────────────────────
     st.subheader("Phase 1 – Set Covering")
-    total_headcount = sum(o.phase2.num_workers for o in result.occupations)
+    total_headcount = max_headcount(cp1)
     peak_sim = int(cp1.coverage.max())
     total_wh = cp1.total_worker_intervals / INTERVALS_PER_HOUR
     n_active = sum(1 for c in cp1.counts if c > 0)
@@ -428,7 +429,8 @@ if result is not None:
         for i, occ in enumerate(result.occupations):
             with occ_cols[i]:
                 occ_wh = occ.phase1.total_worker_intervals / INTERVALS_PER_HOUR
-                st.metric(f"{occ.name} headcount", occ.phase2.num_workers)
+                occ_hc = max_headcount(occ.phase1)
+                st.metric(f"{occ.name} headcount", occ_hc)
                 st.metric(f"{occ.name} worker-h", f"{occ_wh:,.0f}")
 
     # ── Weekly coverage chart (combined + sub-curves) ────────────────────
@@ -561,50 +563,6 @@ if result is not None:
                           legend=dict(orientation="h", y=1.12))
     st.plotly_chart(fig_day, use_container_width=True)
 
-    # ── Phase 2 summary ─────────────────────────────────────────────────
-    st.subheader("Phase 2 – Worker Assignment")
-
-    for occ in result.occupations:
-        p2 = occ.phase2
-        if n_occ > 1:
-            st.markdown(f"**{occ.name}**")
-        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-        mc1.metric("Headcount", p2.num_workers)
-        avg_h = (sum(p2.worker_hours) / max(1, p2.num_workers))
-        mc2.metric("Avg weekly hours", f"{avg_h:.1f}")
-        mc3.metric("FTE (÷45)", f"{sum(p2.worker_hours)/45:.1f}")
-        mc4.metric("Total assigned h",
-                    f"{sum(p2.worker_hours):,.0f}")
-        mc5.metric("Solve time", f"{p2.elapsed_sec:.1f}s")
-
-    # ── Weekly-hours histogram ───────────────────────────────────────────
-    st.subheader("Weekly hours distribution")
-    all_hrs = []
-    for occ in result.occupations:
-        for h in occ.phase2.worker_hours:
-            all_hrs.append({"Hours": h, "Occupation": occ.name})
-    if all_hrs:
-        hdf = pd.DataFrame(all_hrs)
-        fig_h = go.Figure()
-        for i, occ in enumerate(result.occupations):
-            clr = OCC_COLORS[i % len(OCC_COLORS)]
-            sub = hdf[hdf["Occupation"] == occ.name]["Hours"]
-            fig_h.add_trace(go.Histogram(
-                x=sub, name=occ.name,
-                marker_color=clr, opacity=0.7,
-                nbinsx=20,
-            ))
-        fig_h.add_vline(x=params.min_weekly_hours, line_dash="dash",
-                        line_color="orange",
-                        annotation_text=f"Min {params.min_weekly_hours}h")
-        fig_h.add_vline(x=params.max_weekly_hours, line_dash="dash",
-                        line_color="red",
-                        annotation_text=f"Max {params.max_weekly_hours}h")
-        fig_h.update_layout(
-            height=300, barmode="overlay",
-            margin=dict(l=40, r=20, t=30, b=30))
-        st.plotly_chart(fig_h, use_container_width=True)
-
     # ── Shift Types ──────────────────────────────────────────────────────
     st.subheader("Shift types")
     all_st = []
@@ -614,46 +572,6 @@ if result is not None:
     if all_st:
         combined_st = pd.concat(all_st, ignore_index=True)
         st.dataframe(combined_st, use_container_width=True, hide_index=True)
-
-    # ── Full Roster ──────────────────────────────────────────────────────
-    with st.expander("📋 Full Roster"):
-        all_roster = []
-        emp_off = 0
-        for occ in result.occupations:
-            rdf = schedules_to_dataframe(occ.phase2, occ.name, emp_off)
-            prefix = occ.name[:3].upper()
-            if not rdf.empty:
-                rdf["Worker"] = rdf["Worker"].apply(
-                    lambda w: f"{prefix}-{w:03d}")
-            all_roster.append(rdf)
-            emp_off += occ.phase2.num_workers
-        if all_roster:
-            st.dataframe(pd.concat(all_roster, ignore_index=True),
-                         use_container_width=True, hide_index=True)
-
-    # ── Per-Worker Summary ───────────────────────────────────────────────
-    with st.expander("👤 Per-Worker Summary"):
-        ws_rows = []
-        for occ in result.occupations:
-            prefix = occ.name[:3].upper()
-            for w_idx, (sched, hrs) in enumerate(
-                    zip(occ.phase2.worker_schedules,
-                        occ.phase2.worker_hours)):
-                row = {
-                    "Occupation": occ.name,
-                    "Worker": f"{prefix}-{w_idx+1:03d}",
-                    "TotalHours": round(hrs, 1),
-                    "FTE(÷45)": round(hrs / 45, 2),
-                    "Shifts": len(sched),
-                }
-                for d in range(7):
-                    ds = [s for s in sched if s.day == d]
-                    row[DAY_NAMES[d]] = (
-                        ", ".join(s.shift_code for s in ds) if ds else "OFF")
-                ws_rows.append(row)
-        if ws_rows:
-            st.dataframe(pd.DataFrame(ws_rows),
-                         use_container_width=True, hide_index=True)
 
     # ── XLSX download ────────────────────────────────────────────────────
     st.subheader("📥 Download report")
