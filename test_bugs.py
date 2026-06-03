@@ -429,13 +429,15 @@ class TestSolverIntegration(unittest.TestCase):
         self.assertIn(r.combined_phase1.status, ("OPTIMAL", "FEASIBLE"))
         self._assert_coverage_satisfied(r, [d1, d2], "two_curve")
 
-        # Verify that the set of active shift codes is identical for both occupations
-        codes_a = {s.shift_code for s, c in zip(r.occupations[0].phase1.shifts,
-                                                  r.occupations[0].phase1.counts) if c > 0}
-        codes_b = {s.shift_code for s, c in zip(r.occupations[1].phase1.shifts,
-                                                  r.occupations[1].phase1.counts) if c > 0}
-        self.assertEqual(codes_a, codes_b,
-            "Two occupations have different shift codes – shared activation violated")
+        # Verify the correct shared-activation invariant:
+        # each occupation's active codes ⊆ combined active codes
+        combined_active = {s.shift_code for s, c in zip(r.combined_phase1.shifts,
+                                                          r.combined_phase1.counts) if c > 0}
+        for occ in r.occupations:
+            occ_active = {s.shift_code for s, c in zip(occ.phase1.shifts,
+                                                         occ.phase1.counts) if c > 0}
+            self.assertTrue(occ_active.issubset(combined_active),
+                f"Occupation {occ.name} uses shifts not in the combined active set")
 
     def test_force_include_respected(self):
         """A force-included shift code must appear in the solution."""
@@ -671,6 +673,133 @@ class TestShiftCodeFrom(unittest.TestCase):
     def test_max_shift(self):
         # 23:30 + 12 h = 11:30 next day
         self.assertEqual(_shift_code_from(282, 144), "2330-1130")
+
+
+# ── Group H: 5-curve support ──────────────────────────────────────────────────
+
+class TestFiveCurves(unittest.TestCase):
+
+    def _assert_coverage_satisfied(self, result, demands, label=""):
+        for i, (occ, demand) in enumerate(zip(result.occupations, demands)):
+            cov = occ.phase1.coverage
+            deficit = np.maximum(demand - cov, 0)
+            bad = int(np.count_nonzero(deficit))
+            self.assertEqual(bad, 0,
+                f"{label} occ {i} ({occ.name}): {bad} intervals under-covered, "
+                f"max deficit={int(deficit.max())}")
+
+    def test_five_curves_basic_coverage(self):
+        """Five occupations with staggered demands must all be covered."""
+        demands = [
+            day_block(0, 6,  14, 2),
+            day_block(0, 8,  16, 3),
+            day_block(0, 10, 18, 2),
+            day_block(0, 12, 20, 1),
+            day_block(0, 14, 22, 2),
+        ]
+        names = ["A", "B", "C", "D", "E"]
+        p = quick_params()
+        r = solve_multi(demands, names, p)
+        self.assertIn(r.combined_phase1.status, ("OPTIMAL", "FEASIBLE"))
+        self.assertEqual(len(r.occupations), 5)
+        self._assert_coverage_satisfied(r, demands, "five_curves")
+
+    def test_five_curves_shared_shift_codes(self):
+        """Shared activation means: every occupation's active shifts must be a
+        subset of the combined active shifts (z[s]=1 iff any occ uses it).
+        No occupation can use a shift that was globally deactivated."""
+        demands = [day_block(0, 8, 16, i + 1) for i in range(5)]
+        names = [f"Occ{i}" for i in range(5)]
+        p = quick_params()
+        r = solve_multi(demands, names, p)
+        if r.combined_phase1.status not in ("OPTIMAL", "FEASIBLE"):
+            self.skipTest("Infeasible – cannot test shift code sharing")
+
+        # Combined active shift codes (z[s]=1 iff combined count > 0)
+        combined_active = {s.shift_code for s, c in zip(r.combined_phase1.shifts,
+                                                         r.combined_phase1.counts) if c > 0}
+
+        for occ in r.occupations:
+            occ_active = {s.shift_code for s, c in zip(occ.phase1.shifts,
+                                                        occ.phase1.counts) if c > 0}
+            diff = occ_active - combined_active
+            self.assertEqual(diff, set(),
+                f"Occupation {occ.name} uses shifts not in combined active set: {diff}")
+
+        # The union of all per-occ active codes must equal the combined active codes
+        union_codes: set[str] = set()
+        for occ in r.occupations:
+            union_codes |= {s.shift_code for s, c in zip(occ.phase1.shifts,
+                                                           occ.phase1.counts) if c > 0}
+        self.assertEqual(union_codes, combined_active,
+            "Union of per-occ active codes does not match combined active codes")
+
+    def test_five_curves_result_structure(self):
+        """MultiCurveResult must have exactly 5 occupation slots."""
+        demands = [day_block(0, 8, 12, 1)] * 5
+        names = [f"Occ{i}" for i in range(5)]
+        p = quick_params()
+        r = solve_multi(demands, names, p)
+        self.assertEqual(len(r.occupations), 5)
+        for i, occ in enumerate(r.occupations):
+            self.assertEqual(occ.name, names[i])
+            self.assertEqual(occ.demand.shape, (TOTAL_INTERVALS,))
+
+    def test_five_curves_combined_demand(self):
+        """combined_demand must equal the sum of all 5 occupation demands."""
+        demands = [day_block(0, 8, 12, i + 1) for i in range(5)]
+        names = [f"Occ{i}" for i in range(5)]
+        p = quick_params()
+        r = solve_multi(demands, names, p)
+        expected = sum(demands)
+        np.testing.assert_array_equal(r.combined_demand, expected)
+
+    def test_five_curves_combined_coverage(self):
+        """combined coverage == sum of per-occupation coverages."""
+        demands = [day_block(0, 8, 16, i + 1) for i in range(5)]
+        names = [f"Occ{i}" for i in range(5)]
+        p = quick_params()
+        r = solve_multi(demands, names, p)
+        if r.combined_phase1.status not in ("OPTIMAL", "FEASIBLE"):
+            return
+        expected = sum(occ.phase1.coverage for occ in r.occupations)
+        np.testing.assert_array_equal(r.combined_phase1.coverage, expected)
+
+    def test_five_curves_infeasible_no_aliasing(self):
+        """Infeasible 5-curve result must produce 5 independent PhaseOneResult objects."""
+        demands = [flat_demand(50)] * 5
+        p = quick_params(max_headcount_per_day=[1] * 7)
+        r = solve_multi(demands, [f"Occ{i}" for i in range(5)], p)
+        if r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"):
+            self.skipTest("Expected infeasible – cannot test aliasing")
+        ids = [id(occ.phase1) for occ in r.occupations]
+        self.assertEqual(len(ids), len(set(ids)),
+            f"BUG: some occupation PhaseOneResults are aliased. ids={ids}")
+
+    def test_occ_colors_covers_five(self):
+        """OCC_COLORS must have at least 5 entries."""
+        from solver import OCC_COLORS
+        self.assertGreaterEqual(len(OCC_COLORS), 5,
+            f"OCC_COLORS has only {len(OCC_COLORS)} colors – need at least 5")
+
+    def test_five_curves_zero_demand(self):
+        """Five zero-demand occupations must always be feasible."""
+        demands = [zero_demand()] * 5
+        names = [f"Occ{i}" for i in range(5)]
+        p = quick_params()
+        r = solve_multi(demands, names, p)
+        self.assertIn(r.combined_phase1.status, ("OPTIMAL", "FEASIBLE"))
+
+    def test_five_curves_callback_fires(self):
+        """Callback must be called during a 5-curve solve."""
+        demands = [day_block(0, 8, 12, 1)] * 5
+        names = [f"Occ{i}" for i in range(5)]
+        p = quick_params()
+        messages = []
+        solve_multi(demands, names, p, callback=messages.append)
+        self.assertGreater(len(messages), 0)
+        combined = " ".join(str(m) for m in messages)
+        self.assertIn("5 occupation", combined)
 
 
 if __name__ == "__main__":

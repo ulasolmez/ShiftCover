@@ -1,7 +1,7 @@
 """
 ShiftCover – Weekly Shift-Covering Optimiser (OR-Tools CP-SAT)
 ==============================================================
-Supports 1-3 occupation curves with SHARED shift structures.
+Supports 1-5 occupation curves with SHARED shift structures.
 
 Two-phase solver
   Phase 1 – Multi-curve Set Covering via CP-SAT.
@@ -33,7 +33,7 @@ DAY_NAMES = [
     "Friday", "Saturday", "Sunday",
 ]
 DAY_ABBR = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
-OCC_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c"]   # blue, orange, green
+OCC_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]  # blue, orange, green, red, purple
 
 
 # ── Data classes ─────────────────────────────────────────────────────────────

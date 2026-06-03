@@ -1,7 +1,7 @@
 """
 ShiftCover – Streamlit front-end
 ================================
-Supports 1-3 occupation workload curves with shared shift structures.
+Supports 1-5 occupation workload curves with shared shift structures.
 """
 
 import io
@@ -44,10 +44,10 @@ st.markdown("""
 with st.sidebar:
     st.header("Parameters")
 
-    n_curves = st.number_input("Number of occupation curves", 1, 3, 1)
+    n_curves = st.number_input("Number of occupation curves", 1, 5, 1)
     occ_names = []
     for i in range(n_curves):
-        default_name = ["Technician", "Labourer", "Helper"][i]
+        default_name = ["Technician", "Labourer", "Helper", "Supervisor", "Assistant"][i]
         name = st.text_input(f"Occupation {i+1} name",
                              value=default_name, key=f"occ_name_{i}")
         occ_names.append(name)
