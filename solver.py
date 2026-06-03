@@ -479,7 +479,14 @@ def solve_phase1_multi(
         empty = PhaseOneResult(shifts, [], 0,
                                np.zeros(TOTAL_INTERVALS, dtype=int),
                                status_str, elapsed)
-        return [empty] * n_occ, empty
+        # Create independent PhaseOneResult per occupation to avoid aliasing.
+        per_occ_empty = [
+            PhaseOneResult(shifts, [], 0,
+                           np.zeros(TOTAL_INTERVALS, dtype=int),
+                           status_str, elapsed)
+            for _ in range(n_occ)
+        ]
+        return per_occ_empty, empty
 
     # ---- extract per-occupation results ----
     per_occ: List[PhaseOneResult] = []
