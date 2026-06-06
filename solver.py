@@ -98,6 +98,9 @@ class SolverParams:
     max_unique_shifts: int        = 0          # 0 = unlimited
     transition_penalty: int       = 50
     solver_time_limit_sec: int    = 120
+    early_stopping_patience: int = 10          # Number of iterations without improvement before stopping
+    min_coverage_efficiency: float = 0.7       # Minimum coverage efficiency for shift patterns
+    use_warm_start: bool = True                # Whether to use warm starting from previous solutions
     # Per-day limits on distinct entry/exit times (0 = unlimited)
     # Each is a list of 7 ints (Mon–Sun). If None → no constraint.
     max_entries_per_day: Optional[List[int]] = None
@@ -470,10 +473,54 @@ def solve_phase1_multi(
     solver.parameters.max_time_in_seconds = params.solver_time_limit_sec
     solver.parameters.num_workers = 8
     solver.parameters.log_search_progress = False
+    
+    # Early stopping configuration
+    solver.parameters.search_branching = cp_model.PORTFOLIO_SEARCH
+    solver.parameters.subsolvers = ['no_lp']
+    solver.parameters.optimize_with_core = True
+    
+    # Track optimization progress for early stopping
+    prev_objective = float('inf')
+    no_improvement_count = 0
+    
+    # Optional: Prune low-coverage shifts
+    if params.min_coverage_efficiency > 0:
+        coverage_efficiency = {}
+        for s in shifts:
+            covered_intervals = sum(d[t % TOTAL_INTERVALS] > 0 for d in demands 
+                                  for t in range(s.global_start, s.global_end))
+            efficiency = covered_intervals / s.duration_intervals
+            coverage_efficiency[s.idx] = efficiency
+        
+        # Add heuristic constraints
+        for s in shifts:
+            if coverage_efficiency[s.idx] < params.min_coverage_efficiency:
+                model.add(z[s.idx] == 0)
+    
 
     status_code = solver.solve(model)
-    status_str  = solver.status_name(status_code)
-    elapsed     = time.time() - t0
+    
+    # Implement warm starting if there's a previous solution
+    if params.use_warm_start and hasattr(solver, "previous_solution"):
+        solver.warm_start(solver.previous_solution)
+    
+    # Implement early stopping
+    while solver.solution_count() < 1 and no_improvement_count < params.early_stopping_patience:
+        previous_best = solver.best_objective_bound()
+        solver.solve_limited(model, time_limit=params.solver_time_limit_sec)
+        current_best = solver.best_objective_bound()
+        
+        if current_best == previous_best:
+            no_improvement_count += 1
+        else:
+            no_improvement_count = 0
+    
+    status_str = solver.status_name(status_code)
+    elapsed = time.time() - t0
+    
+    # Store solution for potential warm start
+    if status_code in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        solver.previous_solution = model.export_to_proto()
 
     if status_code not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         empty = PhaseOneResult(shifts, [], 0,
