@@ -23,8 +23,8 @@ from solver import (
 from sample_data import generate_sample_demand
 
 # ── Page config ──────────────────────────────────────────────────────────────
-st.set_page_config(page_title="ShiftCover", layout="wide")
-st.title("🕐 ShiftCover – Weekly Shift Optimiser")
+st.set_page_config(page_title="Simplex", layout="wide")
+st.title("🕐 Simplex – Weekly Shift Optimiser")
 
 st.markdown("""
 <style>
@@ -766,6 +766,6 @@ if result is not None:
     st.download_button(
         "⬇ Download XLSX report",
         data=xlsx_bytes,
-        file_name="shiftcover_report.xlsx",
+        file_name="simplex_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
