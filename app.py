@@ -217,6 +217,64 @@ with st.sidebar:
             occ_min_hc.append(occ_daily_min if any(v > 0 for v in occ_daily_min) else None)
     use_occ_min_hc = any(v is not None for v in occ_min_hc)
 
+    # Per-occupation per-shift-code headcount limits
+    occ_sc_hc: list = []
+    with st.expander("🕐 Shift-type headcount limits", expanded=False):
+        st.caption("Set daily max/min workers per shift code per occupation. "
+                   "Select a shift code, then configure per-day limits. "
+                   "0 = unlimited / no minimum. "
+                   "Leave unselected codes unconstrained.")
+        for i in range(n_curves):
+            st.markdown(f"**{occ_names[i]}**")
+            # Let user select which shift codes to constrain for this occupation
+            selected_codes = st.multiselect(
+                f"Shift codes to constrain for {occ_names[i]}",
+                options=_all_codes,
+                default=[],
+                key=f"sc_hc_codes_{i}",
+            )
+            if selected_codes:
+                sc_dict = {}
+                for code in selected_codes:
+                    st.caption(f"  {code}")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.caption("Max per day")
+                        max_daily = []
+                        mx_cols = st.columns(7)
+                        for d in range(7):
+                            with mx_cols[d]:
+                                mx = st.number_input(
+                                    f"max_{i}_{code}_{d}", 0, 500, 0,
+                                    key=f"sc_hc_max_{i}_{code.replace('-','_')}_{d}",
+                                    label_visibility="collapsed",
+                                )
+                                max_daily.append(mx)
+                    with c2:
+                        st.caption("Min per day")
+                        min_daily = []
+                        mn_cols = st.columns(7)
+                        for d in range(7):
+                            with mn_cols[d]:
+                                mn = st.number_input(
+                                    f"min_{i}_{code}_{d}", 0, 500, 0,
+                                    key=f"sc_hc_min_{i}_{code.replace('-','_')}_{d}",
+                                    label_visibility="collapsed",
+                                )
+                                min_daily.append(mn)
+                    has_max = any(v > 0 for v in max_daily)
+                    has_min = any(v > 0 for v in min_daily)
+                    if has_max or has_min:
+                        sc_dict[code] = {}
+                        if has_max:
+                            sc_dict[code]["max"] = max_daily
+                        if has_min:
+                            sc_dict[code]["min"] = min_daily
+                occ_sc_hc.append(sc_dict if sc_dict else None)
+            else:
+                occ_sc_hc.append(None)
+    use_occ_sc_hc = any(v is not None for v in occ_sc_hc)
+
     with st.expander("🔧 Solver", expanded=False):
         time_limit = st.number_input("Time limit (s)", 10, 600, 120, 10)
         t_penalty = st.number_input("Transition penalty", 0, 500, 50, 10)
@@ -238,6 +296,7 @@ params = SolverParams(
     min_headcount_per_day=min_hc if use_min_hc else None,
     occ_max_headcount_per_day=occ_max_hc if use_occ_hc else None,
     occ_min_headcount_per_day=occ_min_hc if use_occ_min_hc else None,
+    occ_headcount_per_shift_code=occ_sc_hc if use_occ_sc_hc else None,
     exclude_night_shifts=no_night,
     circular_week=circular,
     force_include_shifts=force_incl if force_incl else None,
@@ -703,6 +762,51 @@ if result is not None:
                              use_container_width=True, hide_index=True)
             else:
                 st.caption("No per-occupation headcount limits were set.")
+
+    # per-occupation shift-code headcount table
+    if params.occ_headcount_per_shift_code:
+        with st.expander("🕐 Shift-type headcount vs limits", expanded=False):
+            rows = []
+            for i, occ in enumerate(result.occupations):
+                sc_limits = params.occ_headcount_per_shift_code[i]
+                if sc_limits is None:
+                    continue
+                for code, spec in sc_limits.items():
+                    if isinstance(spec, list):
+                        max_limits = spec
+                        min_limits = None
+                    else:
+                        max_limits = spec.get("max")
+                        min_limits = spec.get("min")
+                    # Compute actual workers per shift-code per day
+                    daily_workers = [0] * 7
+                    for s, cnt in zip(occ.phase1.shifts, occ.phase1.counts):
+                        if s.shift_code == code and cnt > 0:
+                            daily_workers[s.day] += cnt
+                    for day in range(7):
+                        actual = daily_workers[day]
+                        max_l = max_limits[day] if max_limits else 0
+                        min_l = min_limits[day] if min_limits else 0
+                        if max_l > 0 or min_l > 0:
+                            status = "✅"
+                            if max_l > 0 and actual > max_l:
+                                status = "❌ VIOLATION (max)"
+                            if min_l > 0 and actual < min_l:
+                                status = "❌ VIOLATION (min)"
+                            rows.append({
+                                "Occupation": occ.name,
+                                "Shift Code": code,
+                                "Day": DAY_NAMES[day],
+                                "Workers": actual,
+                                "Max Limit": max_l if max_l > 0 else "—",
+                                "Min Limit": min_l if min_l > 0 else "—",
+                                "Status": status,
+                            })
+            if rows:
+                st.dataframe(pd.DataFrame(rows),
+                             use_container_width=True, hide_index=True)
+            else:
+                st.caption("No shift-type headcount constraints were active.")
 
     # per-occupation daily min simultaneous headcount table
     if params.occ_min_headcount_per_day:

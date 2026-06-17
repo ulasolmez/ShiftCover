@@ -112,6 +112,12 @@ class SolverParams:
     # Per-occupation per-day min simultaneous workers.
     # List of length n_occ; each element is a list of 7 ints (0 = no minimum) or None.
     occ_min_headcount_per_day: Optional[List[Optional[List[int]]]] = None
+    # Per-occupation per-shift-code per-day max/min workers.
+    # List of length n_occ; each element is None or a dict:
+    #   {"HHMM-HHMM": [max_mon, ..., max_sun]}  or
+    #   {"HHMM-HHMM": {"max": [7 ints], "min": [7 ints]}}  or None.
+    # 0 = unlimited/no minimum.  Only codes present are constrained.
+    occ_headcount_per_shift_code: Optional[List[Optional[Dict]]] = None
     # Exclude shifts that fall entirely within the 20:00–06:00 window
     exclude_night_shifts: bool = False
     # Circular week: Sunday shifts can wrap into Monday
@@ -480,6 +486,41 @@ def _build_multi_curve_model(
                     )
         if callback:
             callback(f"Per-occ min headcount set for {sum(1 for l in params.occ_min_headcount_per_day if l is not None)} occupation(s)")
+
+    # ── Per-occupation per-shift-code headcount limits ───────────────────
+    if params.occ_headcount_per_shift_code:
+        for occ in range(n_occ):
+            sc_limits = params.occ_headcount_per_shift_code[occ]
+            if sc_limits is None:
+                continue
+            for code, spec in sc_limits.items():
+                # spec can be: list[7] (max only) or dict {"max": [...], "min": [...]}
+                if isinstance(spec, list):
+                    max_limits = spec
+                    min_limits = None
+                else:
+                    max_limits = spec.get("max")
+                    min_limits = spec.get("min")
+                # Collect matching shift indices per day
+                per_day: Dict[int, List[int]] = {d: [] for d in range(7)}
+                for s in shifts:
+                    if s.shift_code == code:
+                        per_day[s.day].append(s.idx)
+                for day in range(7):
+                    idxs = per_day[day]
+                    if not idxs:
+                        continue
+                    if max_limits:
+                        limit = max_limits[day]
+                        if limit > 0:
+                            model.add(sum(x[occ][si] for si in idxs) <= limit)
+                    if min_limits:
+                        min_req = min_limits[day]
+                        if min_req > 0:
+                            model.add(sum(x[occ][si] for si in idxs) >= min_req)
+        if callback:
+            n_constrained = sum(1 for sc in params.occ_headcount_per_shift_code if sc is not None)
+            callback(f"Shift-code headcount limits set for {n_constrained} occupation(s)")
 
     # ── Per-day max simultaneous headcount (combined) ─────────────────────
     if params.max_headcount_per_day:
