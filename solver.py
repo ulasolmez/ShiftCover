@@ -296,32 +296,27 @@ def build_coverage_map(
     return cov
 
 
-# ── Phase 1 – Multi-Curve Set Covering ───────────────────────────────────────
-def solve_phase1_multi(
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 1 – Multi-Curve Model Builder
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_multi_curve_model(
     demands: List[np.ndarray],
-    occ_names: List[str],
     params: SolverParams,
+    cov: Dict[int, List[int]],
+    shifts: List[CandidateShift],
+    n_occ: int,
     callback=None,
-) -> Tuple[List[PhaseOneResult], PhaseOneResult]:
+) -> Tuple[cp_model.CpModel, Dict[int, Dict[int, object]], Dict[int, object]]:
     """
-    Solve all occupation curves simultaneously with SHARED shift activation.
-    Returns (per_occ_results, combined_result).
+    Build the CP-SAT model with all Phase 1 constraints.
+
+    Returns:
+        model: The configured CpModel.
+        x:      x[occ][s_idx] = integer variable for workers of occupation occ
+                assigned to shift s.
+        z:      z[s_idx] = boolean activation variable (shared across occupations).
     """
-    n_occ = len(demands)
-    for i, d in enumerate(demands):
-        assert d.shape == (TOTAL_INTERVALS,), \
-            f"Demand[{i}] must have length {TOTAL_INTERVALS}"
-
-    t0 = time.time()
-
-    shifts = generate_candidate_shifts(params)
-    if callback:
-        callback(f"Generated {len(shifts):,} candidate shifts")
-
-    cov = build_coverage_map(shifts)
-    if callback:
-        callback("Built coverage map")
-
     model = cp_model.CpModel()
 
     # Per-occupation decision vars: x[occ][s] = workers of that occ on shift s
@@ -345,29 +340,26 @@ def solve_phase1_multi(
         for s in shifts:
             model.add(x[occ][s.idx] == 0).only_enforce_if(z[s.idx].negated())
 
-    # Force-include shift codes: every matching code must be active
+    # ── Force-include shift codes ─────────────────────────────────────────
     if params.force_include_shifts:
         incl_set = set(params.force_include_shifts)
-        # Group candidate indices by shift_code
         code_to_idxs: Dict[str, List[int]] = {}
         for s in shifts:
             if s.shift_code in incl_set:
                 code_to_idxs.setdefault(s.shift_code, []).append(s.idx)
         for code, idxs in code_to_idxs.items():
-            # At least one candidate with this code must be active
             model.add(sum(z[i] for i in idxs) >= 1)
         if callback:
             callback(f"Force-include {len(code_to_idxs)} shift code(s)")
 
-    # Max unique shifts (shared cardinality)
+    # ── Max unique shifts ─────────────────────────────────────────────────
     if params.max_unique_shifts > 0:
         model.add(sum(z[s.idx] for s in shifts) <= params.max_unique_shifts)
         if callback:
             callback(f"Max unique shifts ≤ {params.max_unique_shifts}")
 
-    # Per-day max distinct entry times
+    # ── Per-day max distinct entry times ──────────────────────────────────
     if params.max_entries_per_day:
-        # Collect distinct start_intervals per day
         day_starts: Dict[int, set] = {d: set() for d in range(7)}
         for s in shifts:
             day_starts[s.day].add(s.start_interval)
@@ -377,8 +369,7 @@ def solve_phase1_multi(
                 continue
             starts = sorted(day_starts[day])
             if len(starts) <= limit:
-                continue  # already within limit, no constraint needed
-            # e_start[day][si] = 1 iff any shift on this day with start_interval==si is active
+                continue
             e_vars = []
             for si in starts:
                 e = model.new_bool_var(f"entry_d{day}_s{si}")
@@ -391,7 +382,7 @@ def solve_phase1_multi(
         if callback:
             callback(f"Max entries/day: {params.max_entries_per_day}")
 
-    # Per-day max distinct exit times
+    # ── Per-day max distinct exit times ───────────────────────────────────
     if params.max_exits_per_day:
         day_ends: Dict[int, set] = {d: set() for d in range(7)}
         for s in shifts:
@@ -417,7 +408,7 @@ def solve_phase1_multi(
         if callback:
             callback(f"Max exits/day: {params.max_exits_per_day}")
 
-    # Per-occupation daily headcount limits
+    # ── Per-occupation daily headcount limits ─────────────────────────────
     if params.occ_max_headcount_per_day:
         for occ in range(n_occ):
             occ_limits = params.occ_max_headcount_per_day[occ]
@@ -439,7 +430,7 @@ def solve_phase1_multi(
         if callback:
             callback(f"Per-occ headcount limits set for {sum(1 for l in params.occ_max_headcount_per_day if l is not None)} occupation(s)")
 
-    # Per-day max simultaneous headcount
+    # ── Per-day max simultaneous headcount (combined) ─────────────────────
     if params.max_headcount_per_day:
         for day in range(7):
             limit = params.max_headcount_per_day[day]
@@ -451,7 +442,6 @@ def solve_phase1_multi(
                 covering = cov[t]
                 if not covering:
                     continue
-                # sum across ALL occupations at interval t
                 total_at_t = []
                 for occ in range(n_occ):
                     total_at_t.extend(x[occ][si] for si in covering)
@@ -459,7 +449,7 @@ def solve_phase1_multi(
         if callback:
             callback(f"Max headcount/day: {params.max_headcount_per_day}")
 
-    # Per-occupation coverage constraints
+    # ── Per-occupation coverage constraints ───────────────────────────────
     for occ in range(n_occ):
         for t in range(TOTAL_INTERVALS):
             if demands[occ][t] <= 0:
@@ -473,7 +463,7 @@ def solve_phase1_multi(
     if callback:
         callback(f"Coverage constraints added for {n_occ} occupation(s)")
 
-    # ---- objective ----
+    # ── Objective ─────────────────────────────────────────────────────────
     obj_terms = []
     for occ in range(n_occ):
         for s in shifts:
@@ -490,7 +480,27 @@ def solve_phase1_multi(
     if callback:
         callback("Model built – starting Phase 1 solve …")
 
-    # ---- solve ----
+    return model, x, z
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 1 – Solver Runner
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _solve_cp_sat(
+    model: cp_model.CpModel,
+    params: SolverParams,
+    t0: float,
+) -> Tuple[cp_model.CpSolver, int, str, float]:
+    """
+    Configure and run the CP-SAT solver.
+
+    Returns:
+        solver:     The CpSolver instance (can query .value() to extract results).
+        status_code:  cp_model.OPTIMAL, FEASIBLE, INFEASIBLE, etc.
+        status_str:   Human-readable status string.
+        elapsed_sec:  Wall-clock seconds from t0 to solve completion.
+    """
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = params.solver_time_limit_sec
     solver.parameters.num_workers = 8
@@ -499,12 +509,40 @@ def solve_phase1_multi(
     status_code = solver.solve(model)
     status_str  = solver.status_name(status_code)
     elapsed     = time.time() - t0
+    return solver, status_code, status_str, elapsed
 
-    if status_code not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 1 – Result Extractor
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _extract_phase1_results(
+    solver: cp_model.CpSolver,
+    status_code: int,
+    status_str: str,
+    elapsed: float,
+    x: Dict[int, Dict[int, object]],
+    shifts: List[CandidateShift],
+    n_occ: int,
+    occ_names: List[str],
+    callback=None,
+) -> Tuple[List[PhaseOneResult], PhaseOneResult]:
+    """
+    Extract per-occupation and combined PhaseOneResult from a solved model.
+
+    If the model is not OPTIMAL/FEASIBLE, returns empty results with the
+    solver status preserved.
+
+    Returns:
+        per_occ:      List of n_occ PhaseOneResults.
+        combined_p1:  Single PhaseOneResult aggregating all occupations.
+    """
+    from ortools.sat.python import cp_model as _cp
+
+    if status_code not in (_cp.OPTIMAL, _cp.FEASIBLE):
         empty = PhaseOneResult(shifts, [], 0,
                                np.zeros(TOTAL_INTERVALS, dtype=int),
                                status_str, elapsed)
-        # Create independent PhaseOneResult per occupation to avoid aliasing.
         per_occ_empty = [
             PhaseOneResult(shifts, [], 0,
                            np.zeros(TOTAL_INTERVALS, dtype=int),
@@ -513,7 +551,6 @@ def solve_phase1_multi(
         ]
         return per_occ_empty, empty
 
-    # ---- extract per-occupation results ----
     per_occ: List[PhaseOneResult] = []
     combined_counts   = [0] * len(shifts)
     combined_coverage = np.zeros(TOTAL_INTERVALS, dtype=int)
@@ -549,6 +586,55 @@ def solve_phase1_multi(
                  f"unique shifts={n_active}")
 
     return per_occ, combined_p1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 1 – Orchestrator
+# ══════════════════════════════════════════════════════════════════════════════
+
+def solve_phase1_multi(
+    demands: List[np.ndarray],
+    occ_names: List[str],
+    params: SolverParams,
+    callback=None,
+) -> Tuple[List[PhaseOneResult], PhaseOneResult]:
+    """
+    Solve all occupation curves simultaneously with SHARED shift activation.
+
+    Orchestrates the three pipeline stages:
+      1. _build_multi_curve_model  – construct CP-SAT model
+      2. _solve_cp_sat              – run the solver
+      3. _extract_phase1_results    – materialise results
+
+    Returns (per_occ_results, combined_result).
+    """
+    n_occ = len(demands)
+    for i, d in enumerate(demands):
+        assert d.shape == (TOTAL_INTERVALS,), \
+            f"Demand[{i}] must have length {TOTAL_INTERVALS}"
+
+    t0 = time.time()
+
+    # ── Stage 1: generate shifts + coverage map ──────────────────────────
+    shifts = generate_candidate_shifts(params)
+    if callback:
+        callback(f"Generated {len(shifts):,} candidate shifts")
+
+    cov = build_coverage_map(shifts)
+    if callback:
+        callback("Built coverage map")
+
+    # ── Stage 2: build model ─────────────────────────────────────────────
+    model, x, z = _build_multi_curve_model(
+        demands, params, cov, shifts, n_occ, callback)
+
+    # ── Stage 3: solve ───────────────────────────────────────────────────
+    solver, status_code, status_str, elapsed = _solve_cp_sat(model, params, t0)
+
+    # ── Stage 4: extract results ─────────────────────────────────────────
+    return _extract_phase1_results(
+        solver, status_code, status_str, elapsed,
+        x, shifts, n_occ, occ_names, callback)
 
 
 # ── Convenience entry points ─────────────────────────────────────────────────
