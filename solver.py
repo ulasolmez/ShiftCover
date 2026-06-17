@@ -107,6 +107,9 @@ class SolverParams:
     # Per-occupation per-day max simultaneous workers.
     # List of length n_occ; each element is a list of 7 ints (0 = unlimited) or None.
     occ_max_headcount_per_day: Optional[List[Optional[List[int]]]] = None
+    # Per-occupation per-day min simultaneous workers.
+    # List of length n_occ; each element is a list of 7 ints (0 = no minimum) or None.
+    occ_min_headcount_per_day: Optional[List[Optional[List[int]]]] = None
     # Exclude shifts that fall entirely within the 20:00–06:00 window
     exclude_night_shifts: bool = False
     # Circular week: Sunday shifts can wrap into Monday
@@ -323,9 +326,19 @@ def _build_multi_curve_model(
     x: Dict[int, Dict[int, object]] = {}
     for occ in range(n_occ):
         x[occ] = {}
-        max_d = int(demands[occ].max()) if demands[occ].max() > 0 else 1
+        peak_d = int(demands[occ].max()) if demands[occ].max() > 0 else 1
+        bound = peak_d
+        # respect per-occ min/max headcount limits when setting variable domain
+        if params.occ_max_headcount_per_day and params.occ_max_headcount_per_day[occ]:
+            vals = [v for v in params.occ_max_headcount_per_day[occ] if v > 0]
+            if vals:
+                bound = max(bound, max(vals))
+        if params.occ_min_headcount_per_day and params.occ_min_headcount_per_day[occ]:
+            vals = [v for v in params.occ_min_headcount_per_day[occ] if v > 0]
+            if vals:
+                bound = max(bound, max(vals))
         for s in shifts:
-            x[occ][s.idx] = model.new_int_var(0, max_d, f"x_{occ}_{s.idx}")
+            x[occ][s.idx] = model.new_int_var(0, bound, f"x_{occ}_{s.idx}")
 
     # Shared activation vars:  z[s] = 1  iff  any occupation uses shift s
     z: Dict[int, object] = {}
@@ -429,6 +442,29 @@ def _build_multi_curve_model(
                     )
         if callback:
             callback(f"Per-occ headcount limits set for {sum(1 for l in params.occ_max_headcount_per_day if l is not None)} occupation(s)")
+
+    # ── Per-occupation daily minimum headcount ────────────────────────────
+    if params.occ_min_headcount_per_day:
+        for occ in range(n_occ):
+            occ_mins = params.occ_min_headcount_per_day[occ]
+            if occ_mins is None:
+                continue
+            for day in range(7):
+                min_limit = occ_mins[day]
+                if min_limit <= 0:
+                    continue
+                day_start = day * INTERVALS_PER_DAY
+                day_end = day_start + INTERVALS_PER_DAY
+                # Enforce min at all intervals within the day
+                for t in range(day_start, day_end):
+                    covering = cov[t]
+                    if not covering:
+                        continue
+                    model.add(
+                        sum(x[occ][si] for si in covering) >= min_limit
+                    )
+        if callback:
+            callback(f"Per-occ min headcount set for {sum(1 for l in params.occ_min_headcount_per_day if l is not None)} occupation(s)")
 
     # ── Per-day max simultaneous headcount (combined) ─────────────────────
     if params.max_headcount_per_day:

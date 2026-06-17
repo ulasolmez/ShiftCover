@@ -14,7 +14,7 @@ Tests for:
 
 import numpy as np
 from solver import (
-    SolverParams, solve_multi,
+    SolverParams, solve_multi, solve_phase1_multi,
     DAY_NAMES, INTERVALS_PER_DAY, INTERVALS_PER_HOUR, TOTAL_INTERVALS,
 )
 
@@ -492,6 +492,142 @@ if r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"):
             f"VIOLATION: {actual} > 4"
         )
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MIN HEADCOUNT TESTS (occ_min_headcount_per_day)
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 65)
+print("TEST 16 – Single occ, demand=3, per-occ min=2 (easily feasible)")
+print("=" * 65)
+p = quick_params()
+p.occ_min_headcount_per_day = [[2] * 7]
+r = solve_multi([flat_demand(3)], ["A"], p)
+cp1 = r.combined_phase1
+check("TEST16a: solver feasible", cp1.status in ("OPTIMAL", "FEASIBLE"))
+if cp1.status in ("OPTIMAL", "FEASIBLE"):
+    for day in range(7):
+        s, e = day * INTERVALS_PER_DAY, (day + 1) * INTERVALS_PER_DAY
+        actual = int(cp1.coverage[s:e].min())
+        check(
+            f"TEST16b-{DAY_NAMES[day]}: min({actual}) >= 2",
+            actual >= 2, f"VIOLATION: {actual} < 2"
+        )
+
+print("\n" + "=" * 65)
+print("TEST 17 – Min=5 but max=4 makes infeasible (min > max)")
+print("=" * 65)
+p = quick_params()
+p.occ_min_headcount_per_day = [[5] * 7]
+p.occ_max_headcount_per_day = [[4] * 7]  # min 5 but max 4 cannot both hold
+r = solve_multi([flat_demand(3)], ["A"], p)
+check("TEST17a: solver INFEASIBLE (min 5 > max 4)",
+      r.combined_phase1.status not in ("OPTIMAL", "FEASIBLE"))
+
+print("\n" + "=" * 65)
+print("TEST 18 – Multi-occ with mixed min + max limits (feasible)")
+print("=" * 65)
+p = quick_params()
+p.occ_min_headcount_per_day = [[1] * 7, [2] * 7]  # A min 1, B min 2
+p.occ_max_headcount_per_day = [[4] * 7, [5] * 7]  # A max 4, B max 5
+r = solve_multi([flat_demand(2), flat_demand(3)], ["A", "B"], p)
+check("TEST18a: solver feasible", r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"))
+if r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"):
+    for day in range(7):
+        s, e = day * INTERVALS_PER_DAY, (day + 1) * INTERVALS_PER_DAY
+        a_cov = r.occupations[0].phase1.coverage
+        b_cov = r.occupations[1].phase1.coverage
+        a_min, a_max = int(a_cov[s:e].min()), int(a_cov[s:e].max())
+        b_min, b_max = int(b_cov[s:e].min()), int(b_cov[s:e].max())
+        check(f"TEST18b-A-{DAY_NAMES[day]}-min", a_min >= 1, f"min({a_min}) >= 1")
+        check(f"TEST18b-A-{DAY_NAMES[day]}-max", a_max <= 4, f"max({a_max}) <= 4")
+        check(f"TEST18c-B-{DAY_NAMES[day]}-min", b_min >= 2, f"min({b_min}) >= 2")
+        check(f"TEST18c-B-{DAY_NAMES[day]}-max", b_max <= 5, f"max({b_max}) <= 5")
+
+print("\n" + "=" * 65)
+print("TEST 19 – Min=0 (no constraint, backward compat)")
+print("=" * 65)
+p = quick_params()
+p.occ_min_headcount_per_day = [[0] * 7]  # all zeros → no constraint applied
+r = solve_multi([flat_demand(2)], ["A"], p)
+check("TEST19a: solver feasible with min=0",
+      r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"))
+
+print("\n" + "=" * 65)
+print("TEST 20 – Min = Demand exactly (tight, should be feasible)")
+print("=" * 65)
+p = quick_params()
+p.occ_min_headcount_per_day = [[3] * 7]
+r = solve_multi([flat_demand(3)], ["A"], p)
+check("TEST20a: feasible when min == demand",
+      r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"))
+if r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"):
+    for day in range(7):
+        s, e = day * INTERVALS_PER_DAY, (day + 1) * INTERVALS_PER_DAY
+        actual = int(r.combined_phase1.coverage[s:e].min())
+        check(f"TEST20b-{DAY_NAMES[day]}: min({actual}) >= 3", actual >= 3)
+
+print("\n" + "=" * 65)
+print("TEST 21 – Empty occ_min_headcount_per_day list (backward compat)")
+print("=" * 65)
+p = quick_params()
+p.occ_min_headcount_per_day = []
+r = solve_multi([flat_demand(4)], ["A"], p)
+check("TEST21a: empty list treated as no min constraint",
+      r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"))
+
+print("\n" + "=" * 65)
+print("TEST 22 – Mixed: some occs with min, some without")
+print("=" * 65)
+p = quick_params()
+p.occ_min_headcount_per_day = [[1] * 7, None, [2] * 7]
+r = solve_multi([flat_demand(2), flat_demand(3), flat_demand(2)], ["A", "B", "C"], p)
+check("TEST22a: mixed min limits handled",
+      r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"))
+if r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"):
+    for day in range(7):
+        s, e = day * INTERVALS_PER_DAY, (day + 1) * INTERVALS_PER_DAY
+        a_min = int(r.occupations[0].phase1.coverage[s:e].min())
+        c_min = int(r.occupations[2].phase1.coverage[s:e].min())
+        check(f"TEST22b-A-{DAY_NAMES[day]}", a_min >= 1, f"min({a_min}) >= 1")
+        check(f"TEST22c-C-{DAY_NAMES[day]}", c_min >= 2, f"min({c_min}) >= 2")
+
+print("\n" + "=" * 65)
+print("TEST 23 – Min headcount + global max_headcount_per_day combined")
+print("=" * 65)
+p = quick_params(max_headcount_per_day=[5] * 7)
+p.occ_min_headcount_per_day = [[1] * 7, [1] * 7]
+r = solve_multi([flat_demand(2), flat_demand(2)], ["A", "B"], p)
+check("TEST23a: combined min + global max feasible",
+      r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"))
+if r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"):
+    for day in range(7):
+        s, e = day * INTERVALS_PER_DAY, (day + 1) * INTERVALS_PER_DAY
+        a_min = int(r.occupations[0].phase1.coverage[s:e].min())
+        b_min = int(r.occupations[1].phase1.coverage[s:e].min())
+        total = int(r.combined_phase1.coverage[s:e].max())
+        check(f"TEST23b-A-min-{DAY_NAMES[day]}", a_min >= 1, f"min({a_min}) >= 1")
+        check(f"TEST23b-B-min-{DAY_NAMES[day]}", b_min >= 1, f"min({b_min}) >= 1")
+        check(f"TEST23c-total-{DAY_NAMES[day]}", total <= 5, f"total({total}) <= 5")
+
+print("\n" + "=" * 65)
+print("TEST 24 – 5 occupations with per-occ min headcount")
+print("=" * 65)
+p = quick_params()
+p.occ_min_headcount_per_day = [
+    [2] * 7, [1] * 7, [1] * 7, [1] * 7, [1] * 7,
+]
+r = solve_multi([flat_demand(3) for _ in range(5)], ["Tech", "Lab", "Help", "Sup", "Asst"], p)
+check("TEST24a: 5-occ with min headcount feasible",
+      r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"))
+if r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"):
+    occ_names_list = ["Tech", "Lab", "Help", "Sup", "Asst"]
+    min_vals = [2, 1, 1, 1, 1]
+    for i, (name, mv) in enumerate(zip(occ_names_list, min_vals)):
+        for day in range(7):
+            s, e = day * INTERVALS_PER_DAY, (day + 1) * INTERVALS_PER_DAY
+            actual = int(r.occupations[i].phase1.coverage[s:e].min())
+            check(f"TEST24b-{name}-{DAY_NAMES[day]}: min({actual}) >= {mv}", actual >= mv)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SUMMARY

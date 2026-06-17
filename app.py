@@ -187,6 +187,28 @@ with st.sidebar:
             occ_max_hc.append(occ_daily if any(v > 0 for v in occ_daily) else None)
     use_occ_hc = any(v is not None for v in occ_max_hc)
 
+    # Per-occupation daily minimum headcount
+    occ_min_hc: list = []
+    with st.expander("👤 Min headcount per occupation per day", expanded=False):
+        st.caption("Set a minimum number of workers of each occupation that must be "
+                   "working simultaneously per day. 0 = no minimum.")
+        for i in range(n_curves):
+            st.markdown(f"**{occ_names[i]}**")
+            occ_daily_min = []
+            cols = st.columns(7)
+            for d in range(7):
+                with cols[d]:
+                    st.caption(DAY_SHORT[d])
+                    v = st.number_input(
+                        f"##min_{occ_names[i]}_{DAY_SHORT[d]}",
+                        0, 500, 0,
+                        key=f"occ_min_hc_{i}_{d}",
+                        label_visibility="collapsed",
+                    )
+                    occ_daily_min.append(v)
+            occ_min_hc.append(occ_daily_min if any(v > 0 for v in occ_daily_min) else None)
+    use_occ_min_hc = any(v is not None for v in occ_min_hc)
+
     with st.expander("🔧 Solver", expanded=False):
         time_limit = st.number_input("Time limit (s)", 10, 600, 120, 10)
         t_penalty = st.number_input("Transition penalty", 0, 500, 50, 10)
@@ -206,6 +228,7 @@ params = SolverParams(
     max_exits_per_day=max_exits if use_exits else None,
     max_headcount_per_day=max_hc if use_hc else None,
     occ_max_headcount_per_day=occ_max_hc if use_occ_hc else None,
+    occ_min_headcount_per_day=occ_min_hc if use_occ_min_hc else None,
     exclude_night_shifts=no_night,
     circular_week=circular,
     force_include_shifts=force_incl if force_incl else None,
@@ -647,6 +670,35 @@ if result is not None:
                              use_container_width=True, hide_index=True)
             else:
                 st.caption("No per-occupation headcount limits were set.")
+
+    # per-occupation daily min simultaneous headcount table
+    if params.occ_min_headcount_per_day:
+        with st.expander("👤 Per-occupation daily headcount vs minimum", expanded=False):
+            rows = []
+            for i, occ in enumerate(result.occupations):
+                occ_mins = params.occ_min_headcount_per_day[i]
+                if occ_mins is None:
+                    continue
+                cov = occ.phase1.coverage
+                for day in range(7):
+                    min_req = occ_mins[day]
+                    if min_req <= 0:
+                        continue
+                    s = day * INTERVALS_PER_DAY
+                    e = s + INTERVALS_PER_DAY
+                    actual_min = int(cov[s:e].min())
+                    rows.append({
+                        "Occupation": occ.name,
+                        "Day": DAY_NAMES[day],
+                        "Min Simultaneous": actual_min,
+                        "Required Min": min_req,
+                        "Status": "✅" if actual_min >= min_req else "❌ VIOLATION",
+                    })
+            if rows:
+                st.dataframe(pd.DataFrame(rows),
+                             use_container_width=True, hide_index=True)
+            else:
+                st.caption("No per-occupation minimum headcount requirements were set.")
 
     # ── Weekly coverage chart (combined + sub-curves) ────────────────────
     st.subheader("Weekly coverage")
