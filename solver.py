@@ -90,7 +90,7 @@ class CandidateShift:
 class SolverParams:
     min_shift_hours: float        = 3.0
     max_shift_hours: float        = 12.0
-    shift_start_granularity_min: int = 15
+    shift_start_granularity_min: int = 15 
     shift_duration_step_min: int  = 30
     min_weekly_hours: float       = 40.0
     max_weekly_hours: float       = 50.0
@@ -141,9 +141,22 @@ def daily_entry_headcount(p1: PhaseOneResult) -> List[int]:
     return daily
 
 
+def peak_daily_simultaneous(p1: PhaseOneResult) -> List[int]:
+    """Peak simultaneous workers per day from the coverage array."""
+    peaks = []
+    for day in range(7):
+        s = day * INTERVALS_PER_DAY
+        e = s + INTERVALS_PER_DAY
+        peaks.append(int(p1.coverage[s:e].max()))
+    return peaks
+
+
 def max_headcount(p1: PhaseOneResult) -> int:
-    """Peak single-day headcount across the week."""
-    return max(daily_entry_headcount(p1))
+    """Peak simultaneous workers across the week."""
+    if p1.counts:  # non-empty result
+        peaks = peak_daily_simultaneous(p1)
+        return max(peaks) if peaks else 0
+    return 0
 
 
 @dataclass

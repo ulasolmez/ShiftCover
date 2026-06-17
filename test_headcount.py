@@ -73,8 +73,9 @@ print()
 check("TEST1a: entries overstate peak_sim on at least one day (expected)",
       entries_overstate_any,
       "(this is why displayed headcount > constraint limit)")
-check("TEST1b: max_headcount() == max(entries)",
-      max_headcount(cp1) == max(entries))
+check("TEST1b: max_headcount() == max(peak_sims) (simultaneous, not entries)",
+      max_headcount(cp1) == max(peak_sims),
+      f"entries_max={max(entries)} peak_sim_max={max_headcount(cp1)}")
 check("TEST1c: peak_sim == coverage.max()",
       max(peak_sims) == int(cp1.coverage.max()))
 # These should differ whenever multiple overlapping shifts cover the same day
@@ -200,13 +201,15 @@ if cp4.status in ("OPTIMAL", "FEASIBLE"):
     else:
         ok("TEST4a: constraint correct – peak_sim <= limit on every day", True)
 
-    if display_bugs:
-        print("\n  *** DISPLAY BUGS (entries > limit, but sim is OK): ***")
-        for dn, v in display_bugs:
-            fail(f"TEST4b display {dn}", f"entries={v} > limit={LIMIT}",
-                 "reported by max_headcount() – fix: use peak_sim not entries")
+    # The fix: max_headcount() now uses peak_simultaneous, not entries.
+    # Entries may still exceed the limit (shifts overlap differently), but
+    # max_headcount() == max(peak_sims) which should be <= LIMIT.
+    reported_hc = max_headcount(cp4)
+    if reported_hc <= LIMIT:
+        ok("TEST4b: max_headcount() (display) <= limit (FIXED)", f"{reported_hc} <= {LIMIT}")
     else:
-        ok("TEST4b: no display overstatement on any day", True)
+        fail("TEST4b display", f"max_headcount={reported_hc} > limit={LIMIT}",
+             "reported by max_headcount() – still using entries instead of peak_sim")
 else:
     print(f"  Status: {cp4.status} – the demand cannot be covered within HC={LIMIT}.")
 
