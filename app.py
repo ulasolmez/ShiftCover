@@ -239,15 +239,19 @@ with st.sidebar:
                     st.caption(f"  {code}")
                     max_daily = []
                     min_daily = []
-                    # Day header row
-                    day_cols = st.columns(7)
+                    # Day header row (first column empty for label)
+                    hdr_cols = st.columns([0.4, 1, 1, 1, 1, 1, 1, 1])
+                    with hdr_cols[0]:
+                        st.caption("")
                     for d in range(7):
-                        with day_cols[d]:
+                        with hdr_cols[d + 1]:
                             st.caption(DAY_SHORT[d])
                     # Max row
-                    max_cols = st.columns(7)
+                    max_cols = st.columns([0.4, 1, 1, 1, 1, 1, 1, 1])
+                    with max_cols[0]:
+                        st.caption("Max")
                     for d in range(7):
-                        with max_cols[d]:
+                        with max_cols[d + 1]:
                             mx = st.number_input(
                                 f"max_{i}_{code}_{d}", 0, 500, 0,
                                 key=f"sc_hc_max_{i}_{code.replace('-','_')}_{d}",
@@ -255,21 +259,17 @@ with st.sidebar:
                             )
                             max_daily.append(mx)
                     # Min row
-                    min_cols = st.columns(7)
+                    min_cols = st.columns([0.4, 1, 1, 1, 1, 1, 1, 1])
+                    with min_cols[0]:
+                        st.caption("Min")
                     for d in range(7):
-                        with min_cols[d]:
+                        with min_cols[d + 1]:
                             mn = st.number_input(
                                 f"min_{i}_{code}_{d}", 0, 500, 0,
                                 key=f"sc_hc_min_{i}_{code.replace('-','_')}_{d}",
                                 label_visibility="collapsed",
                             )
                             min_daily.append(mn)
-                    # "Max" / "Min" row labels alongside day columns
-                    lbl_cols = st.columns([1, 1, 1, 1, 1, 1, 1, 0.5])
-                    with lbl_cols[0]:
-                        st.caption("Max →")
-                    with lbl_cols[7]:
-                        st.caption("← Min")
                     has_max = any(v > 0 for v in max_daily)
                     has_min = any(v > 0 for v in min_daily)
                     if has_max or has_min:
