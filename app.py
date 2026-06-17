@@ -26,6 +26,13 @@ from sample_data import generate_sample_demand
 st.set_page_config(page_title="Simplex", layout="wide")
 st.title("🕐 Simplex – Weekly Shift Optimiser")
 
+# ── Handle auto-fill from demand peaks (must run BEFORE sidebar widgets) ─────
+if st.session_state.get("_occ_hc_fill_data"):
+    fill_data = st.session_state["_occ_hc_fill_data"]
+    for key, val in fill_data.items():
+        st.session_state[key] = val
+    del st.session_state["_occ_hc_fill_data"]
+
 st.markdown("""
 <style>
 /* Sticky Run Optimiser button – floats at top of main area while scrolling */
@@ -411,8 +418,10 @@ if demands is not None:
                 if st.button("📋 Copy peaks to limits", key="copy_peaks_btn",
                              help="Auto-fill the per-occupation headcount limit boxes "
                                   "in the sidebar with (peak + buffer) for each day."):
+                    fill_data = {}
                     for (i, day), peak in peak_lookup.items():
-                        st.session_state[f"occ_hc_{i}_{day}"] = peak + peak_buffer
+                        fill_data[f"occ_hc_{i}_{day}"] = peak + peak_buffer
+                    st.session_state["_occ_hc_fill_data"] = fill_data
                     st.rerun()
             st.caption("Use these peaks to set **Max headcount per occupation per day** "
                        "limits in the sidebar. Set each occupation's daily cap ≥ its peak demand.")
