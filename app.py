@@ -168,16 +168,15 @@ with st.sidebar:
             cols = st.columns(7)
             for d in range(7):
                 with cols[d]:
+                    st.caption(DAY_SHORT[d])
                     v = st.number_input(
-                        f"{DAY_SHORT[d]}",
+                        f"##{occ_names[i]}_{DAY_SHORT[d]}",
                         0, 500, 0,
                         key=f"occ_hc_{i}_{d}",
-                        label_visibility="collapsed" if d > 0 else "visible"
+                        label_visibility="collapsed",
                     )
-                    if d == 0:
-                        st.caption(DAY_SHORT[d])
                     occ_daily.append(v)
-            # Convert 0 to 0 (meaning unlimited in the solver)
+            # 0 = unlimited (no constraint applied in solver)
             occ_max_hc.append(occ_daily if any(v > 0 for v in occ_daily) else None)
     use_occ_hc = any(v is not None for v in occ_max_hc)
 
@@ -381,6 +380,24 @@ if demands is not None:
 
 # ── Solve ────────────────────────────────────────────────────────────────────
 if demands is not None:
+    # ── Daily peak demand reference ──────────────────────────────────────
+    with st.expander("📊 Daily peak demand by occupation", expanded=True):
+        peak_rows = []
+        for i, (d, name) in enumerate(zip(demands, stored_names)):
+            for day in range(7):
+                s = day * INTERVALS_PER_DAY
+                e = s + INTERVALS_PER_DAY
+                peak_rows.append({
+                    "Occupation": name,
+                    "Day": DAY_NAMES[day],
+                    "Peak Demand": int(d[s:e].max()),
+                })
+        if peak_rows:
+            st.dataframe(pd.DataFrame(peak_rows),
+                         use_container_width=True, hide_index=True)
+            st.caption("Use these peaks to set **Max headcount per occupation per day** "
+                       "limits in the sidebar. Set each occupation's daily cap ≥ its peak demand.")
+
     # Demand summary
     total_demand_h = sum(d.sum() for d in demands) / INTERVALS_PER_HOUR
     peak_total = int(sum(demands).max())
