@@ -147,7 +147,7 @@ with st.sidebar:
     use_entries = any(v > 0 for v in max_entries)
     use_exits = any(v > 0 for v in max_exits)
 
-    with st.expander("👥 Max headcount per day", expanded=False):
+    with st.expander("👥 Max headcount per day (combined)", expanded=False):
         st.caption("Max simultaneous workers (all occupations) per day. "
                    "0 = unlimited.")
         max_hc = []
@@ -156,6 +156,30 @@ with st.sidebar:
                                 0, 500, 0, key=f"hc_{d}")
             max_hc.append(h)
     use_hc = any(v > 0 for v in max_hc)
+
+    # Per-occupation daily headcount limits
+    occ_max_hc: list = []
+    with st.expander("👤 Max headcount per occupation per day", expanded=False):
+        st.caption("Set how many workers of each occupation can work simultaneously "
+                   "per day. 0 = unlimited (use combined limit or no restriction).")
+        for i in range(n_curves):
+            st.markdown(f"**{occ_names[i]}**")
+            occ_daily = []
+            cols = st.columns(7)
+            for d in range(7):
+                with cols[d]:
+                    v = st.number_input(
+                        f"{DAY_SHORT[d]}",
+                        0, 500, 0,
+                        key=f"occ_hc_{i}_{d}",
+                        label_visibility="collapsed" if d > 0 else "visible"
+                    )
+                    if d == 0:
+                        st.caption(DAY_SHORT[d])
+                    occ_daily.append(v)
+            # Convert 0 to 0 (meaning unlimited in the solver)
+            occ_max_hc.append(occ_daily if any(v > 0 for v in occ_daily) else None)
+    use_occ_hc = any(v is not None for v in occ_max_hc)
 
     with st.expander("🔧 Solver", expanded=False):
         time_limit = st.number_input("Time limit (s)", 10, 600, 120, 10)
@@ -175,6 +199,7 @@ params = SolverParams(
     max_entries_per_day=max_entries if use_entries else None,
     max_exits_per_day=max_exits if use_exits else None,
     max_headcount_per_day=max_hc if use_hc else None,
+    occ_max_headcount_per_day=occ_max_hc if use_occ_hc else None,
     exclude_night_shifts=no_night,
     circular_week=circular,
     force_include_shifts=force_incl if force_incl else None,
@@ -541,7 +566,7 @@ if result is not None:
             else:
                 st.caption("No shift types added or removed.")
 
-    # per-occupation headcount
+    # per-occupation headcount metrics
     if n_occ > 1:
         occ_cols = st.columns(n_occ)
         for i, occ in enumerate(result.occupations):
@@ -550,6 +575,33 @@ if result is not None:
                 occ_hc = max_headcount(occ.phase1)
                 st.metric(f"{occ.name} headcount", occ_hc)
                 st.metric(f"{occ.name} worker-h", f"{occ_wh:,.0f}")
+
+    # per-occupation daily max simultaneous headcount table
+    if params.occ_max_headcount_per_day:
+        with st.expander("👤 Per-occupation daily headcount vs limit", expanded=False):
+            rows = []
+            for i, occ in enumerate(result.occupations):
+                occ_limits = params.occ_max_headcount_per_day[i]
+                if occ_limits is None:
+                    continue
+                cov = occ.phase1.coverage
+                for day in range(7):
+                    s = day * INTERVALS_PER_DAY
+                    e = s + INTERVALS_PER_DAY
+                    actual_max = int(cov[s:e].max())
+                    limit = occ_limits[day]
+                    rows.append({
+                        "Occupation": occ.name,
+                        "Day": DAY_NAMES[day],
+                        "Peak Simultaneous": actual_max,
+                        "Limit": limit,
+                        "Status": "✅" if actual_max <= limit else "❌ VIOLATION",
+                    })
+            if rows:
+                st.dataframe(pd.DataFrame(rows),
+                             use_container_width=True, hide_index=True)
+            else:
+                st.caption("No per-occupation headcount limits were set.")
 
     # ── Weekly coverage chart (combined + sub-curves) ────────────────────
     st.subheader("Weekly coverage")

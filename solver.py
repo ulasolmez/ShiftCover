@@ -104,6 +104,9 @@ class SolverParams:
     max_exits_per_day: Optional[List[int]] = None
     # Per-day max simultaneous workers (0 = unlimited). List of 7 ints.
     max_headcount_per_day: Optional[List[int]] = None
+    # Per-occupation per-day max simultaneous workers.
+    # List of length n_occ; each element is a list of 7 ints (0 = unlimited) or None.
+    occ_max_headcount_per_day: Optional[List[Optional[List[int]]]] = None
     # Exclude shifts that fall entirely within the 20:00–06:00 window
     exclude_night_shifts: bool = False
     # Circular week: Sunday shifts can wrap into Monday
@@ -413,6 +416,28 @@ def solve_phase1_multi(
             model.add(sum(x_vars) <= limit)
         if callback:
             callback(f"Max exits/day: {params.max_exits_per_day}")
+
+    # Per-occupation daily headcount limits
+    if params.occ_max_headcount_per_day:
+        for occ in range(n_occ):
+            occ_limits = params.occ_max_headcount_per_day[occ]
+            if occ_limits is None:
+                continue
+            for day in range(7):
+                limit = occ_limits[day]
+                if limit <= 0:
+                    continue
+                day_start = day * INTERVALS_PER_DAY
+                day_end = day_start + INTERVALS_PER_DAY
+                for t in range(day_start, day_end):
+                    covering = cov[t]
+                    if not covering:
+                        continue
+                    model.add(
+                        sum(x[occ][si] for si in covering) <= limit
+                    )
+        if callback:
+            callback(f"Per-occ headcount limits set for {sum(1 for l in params.occ_max_headcount_per_day if l is not None)} occupation(s)")
 
     # Per-day max simultaneous headcount
     if params.max_headcount_per_day:
