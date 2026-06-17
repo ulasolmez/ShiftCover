@@ -90,7 +90,7 @@ class CandidateShift:
 class SolverParams:
     min_shift_hours: float        = 3.0
     max_shift_hours: float        = 12.0
-    shift_start_granularity_min: int = 15 
+    shift_start_granularity_min: int = 30
     shift_duration_step_min: int  = 30
     min_weekly_hours: float       = 40.0
     max_weekly_hours: float       = 50.0
@@ -104,6 +104,8 @@ class SolverParams:
     max_exits_per_day: Optional[List[int]] = None
     # Per-day max simultaneous workers (0 = unlimited). List of 7 ints.
     max_headcount_per_day: Optional[List[int]] = None
+    # Per-day min simultaneous workers combined across ALL occupations (0 = no minimum). List of 7 ints.
+    min_headcount_per_day: Optional[List[int]] = None
     # Per-occupation per-day max simultaneous workers.
     # List of length n_occ; each element is a list of 7 ints (0 = unlimited) or None.
     occ_max_headcount_per_day: Optional[List[Optional[List[int]]]] = None
@@ -497,6 +499,25 @@ def _build_multi_curve_model(
                 model.add(sum(total_at_t) <= limit)
         if callback:
             callback(f"Max headcount/day: {params.max_headcount_per_day}")
+
+    # ── Per-day min simultaneous headcount (combined) ─────────────────────
+    if params.min_headcount_per_day:
+        for day in range(7):
+            min_limit = params.min_headcount_per_day[day]
+            if min_limit <= 0:
+                continue
+            day_start = day * INTERVALS_PER_DAY
+            day_end = day_start + INTERVALS_PER_DAY
+            for t in range(day_start, day_end):
+                covering = cov[t]
+                if not covering:
+                    continue
+                total_at_t = []
+                for occ in range(n_occ):
+                    total_at_t.extend(x[occ][si] for si in covering)
+                model.add(sum(total_at_t) >= min_limit)
+        if callback:
+            callback(f"Min headcount/day: {params.min_headcount_per_day}")
 
     # ── Per-occupation coverage constraints ───────────────────────────────
     for occ in range(n_occ):

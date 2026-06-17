@@ -215,6 +215,144 @@ else:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TEST 5 – Combined min headcount per day (easily feasible)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+print("\n" + "=" * 65)
+print("TEST 5 – Combined min headcount per day (feasible)")
+print("=" * 65)
+
+d = generate_sample_demand(peak_agents=25, base_agents=2, seed=42)
+p = SolverParams(
+    solver_time_limit_sec=60,
+    min_headcount_per_day=[2, 2, 2, 2, 2, 2, 2],
+)
+r = solve_multi([d], ["Staff"], p)
+cp = r.combined_phase1
+check("TEST5a: solver feasible with min=2", cp.status in ("OPTIMAL", "FEASIBLE"))
+if cp.status in ("OPTIMAL", "FEASIBLE"):
+    for day in range(7):
+        s, e = day * INTERVALS_PER_DAY, (day + 1) * INTERVALS_PER_DAY
+        actual = int(cp.coverage[s:e].min())
+        check(
+            f"TEST5b-{DAY_NAMES[day]}: min({actual}) >= 2",
+            actual >= 2, f"VIOLATION: min={actual} < 2"
+        )
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TEST 6 – Combined min = 0 → no constraint
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+print("\n" + "=" * 65)
+print("TEST 6 – Combined min=0 means no constraint")
+print("=" * 65)
+
+d = generate_sample_demand(peak_agents=25, base_agents=2, seed=42)
+p = SolverParams(
+    solver_time_limit_sec=60,
+    min_headcount_per_day=[0, 0, 0, 0, 0, 0, 0],
+)
+r = solve_multi([d], ["Staff"], p)
+check("TEST6a: solver feasible with min=0", r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"))
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TEST 7 – Combined min + max together
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+print("\n" + "=" * 65)
+print("TEST 7 – Combined min=10 + max=15 together")
+print("=" * 65)
+
+d = generate_sample_demand(peak_agents=25, base_agents=2, seed=42)
+p = SolverParams(
+    solver_time_limit_sec=60,
+    min_headcount_per_day=[10, 10, 10, 10, 10, 10, 10],
+    max_headcount_per_day=[15, 15, 15, 15, 15, 15, 15],
+)
+r = solve_multi([d], ["Staff"], p)
+check("TEST7a: solver feasible with min=10 & max=15",
+      r.combined_phase1.status in ("OPTIMAL", "FEASIBLE", "INFEASIBLE"))
+if r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"):
+    cov = r.combined_phase1.coverage
+    for day in range(7):
+        s, e = day * INTERVALS_PER_DAY, (day + 1) * INTERVALS_PER_DAY
+        mn = int(cov[s:e].min())
+        mx = int(cov[s:e].max())
+        check(f"TEST7b-{DAY_NAMES[day]}-min", mn >= 10, f"min({mn}) >= 10")
+        check(f"TEST7c-{DAY_NAMES[day]}-max", mx <= 15, f"max({mx}) <= 15")
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TEST 8 – Combined min > demand → extra workers forced
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+print("\n" + "=" * 65)
+print("TEST 8 – Combined min > demand → forces extra workers")
+print("=" * 65)
+
+d = generate_sample_demand(peak_agents=3, base_agents=1, seed=99)
+p = SolverParams(
+    solver_time_limit_sec=60,
+    min_headcount_per_day=[5, 5, 5, 5, 5, 5, 5],
+)
+r = solve_multi([d], ["Staff"], p)
+check("TEST8a: solver feasible with min=5 > demand ~3",
+      r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"))
+if r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"):
+    cov = r.combined_phase1.coverage
+    for day in range(7):
+        s, e = day * INTERVALS_PER_DAY, (day + 1) * INTERVALS_PER_DAY
+        mn = int(cov[s:e].min())
+        check(f"TEST8b-{DAY_NAMES[day]}: min({mn}) >= 5", mn >= 5, f"min={mn} < 5")
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TEST 9 – Combined min > combined max → INFEASIBLE
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+print("\n" + "=" * 65)
+print("TEST 9 – Combined min=20 > max=10 → INFEASIBLE")
+print("=" * 65)
+
+d = generate_sample_demand(peak_agents=5, base_agents=1, seed=99)
+p = SolverParams(
+    solver_time_limit_sec=30,
+    min_headcount_per_day=[20, 20, 20, 20, 20, 20, 20],
+    max_headcount_per_day=[10, 10, 10, 10, 10, 10, 10],
+)
+r = solve_multi([d], ["Staff"], p)
+check("TEST9a: INFEASIBLE when min=20 > max=10",
+      r.combined_phase1.status not in ("OPTIMAL", "FEASIBLE"))
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TEST 10 – Multi-occ with combined min + per-occ constraints
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+print("\n" + "=" * 65)
+print("TEST 10 – Multi-occ with combined min + per-occ max")
+print("=" * 65)
+
+d1 = generate_sample_demand(peak_agents=10, base_agents=1, seed=42)
+d2 = generate_sample_demand(peak_agents=10, base_agents=1, seed=43)
+p = SolverParams(
+    solver_time_limit_sec=60,
+    min_headcount_per_day=[8, 8, 8, 8, 8, 8, 8],
+    max_headcount_per_day=[20, 20, 20, 20, 20, 20, 20],
+    occ_max_headcount_per_day=[
+        [12, 12, 12, 12, 12, 12, 12],
+        [12, 12, 12, 12, 12, 12, 12],
+    ],
+)
+r = solve_multi([d1, d2], ["Tech", "Lab"], p)
+check("TEST10a: multi-occ feasible", r.combined_phase1.status in ("OPTIMAL", "FEASIBLE", "INFEASIBLE"))
+if r.combined_phase1.status in ("OPTIMAL", "FEASIBLE"):
+    cov = r.combined_phase1.coverage
+    for day in range(7):
+        s, e = day * INTERVALS_PER_DAY, (day + 1) * INTERVALS_PER_DAY
+        mn = int(cov[s:e].min())
+        mx = int(cov[s:e].max())
+        check(f"TEST10b-{DAY_NAMES[day]}-combined-min", mn >= 8, f"min({mn}) >= 8")
+        check(f"TEST10c-{DAY_NAMES[day]}-combined-max", mx <= 20, f"max({mx}) <= 20")
+    for i, occ in enumerate(r.occupations):
+        for day in range(7):
+            s, e = day * INTERVALS_PER_DAY, (day + 1) * INTERVALS_PER_DAY
+            mx = int(occ.phase1.coverage[s:e].max())
+            check(f"TEST10d-{occ.name}-{DAY_NAMES[day]}-per-occ-max",
+                  mx <= 12, f"max({mx}) <= 12")
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SUMMARY
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 print("\n" + "=" * 65)

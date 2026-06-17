@@ -154,15 +154,23 @@ with st.sidebar:
     use_entries = any(v > 0 for v in max_entries)
     use_exits = any(v > 0 for v in max_exits)
 
-    with st.expander("👥 Max headcount per day (combined)", expanded=False):
-        st.caption("Max simultaneous workers (all occupations) per day. "
-                   "0 = unlimited.")
+    with st.expander("👥 Headcount limits per day (combined)", expanded=False):
+        st.caption("Max and min simultaneous workers (all occupations combined) "
+                   "per day. 0 = unlimited / no minimum.")
         max_hc = []
+        min_hc = []
         for d in range(7):
-            h = st.number_input(f"{DAY_SHORT[d]} max headcount",
-                                0, 500, 0, key=f"hc_{d}")
-            max_hc.append(h)
+            col_max, col_min = st.columns(2)
+            with col_max:
+                mx = st.number_input(f"{DAY_SHORT[d]} max",
+                                     0, 500, 0, key=f"hc_{d}")
+                max_hc.append(mx)
+            with col_min:
+                mn = st.number_input(f"{DAY_SHORT[d]} min",
+                                     0, 500, 0, key=f"min_hc_{d}")
+                min_hc.append(mn)
     use_hc = any(v > 0 for v in max_hc)
+    use_min_hc = any(v > 0 for v in min_hc)
 
     # Per-occupation daily headcount limits
     occ_max_hc: list = []
@@ -227,6 +235,7 @@ params = SolverParams(
     max_entries_per_day=max_entries if use_entries else None,
     max_exits_per_day=max_exits if use_exits else None,
     max_headcount_per_day=max_hc if use_hc else None,
+    min_headcount_per_day=min_hc if use_min_hc else None,
     occ_max_headcount_per_day=occ_max_hc if use_occ_hc else None,
     occ_min_headcount_per_day=occ_min_hc if use_occ_min_hc else None,
     exclude_night_shifts=no_night,
@@ -643,6 +652,30 @@ if result is not None:
                 occ_hc = max_headcount(occ.phase1)
                 st.metric(f"{occ.name} headcount", occ_hc)
                 st.metric(f"{occ.name} worker-h", f"{occ_wh:,.0f}")
+
+    # combined daily min simultaneous headcount table
+    if params.min_headcount_per_day:
+        with st.expander("👥 Combined daily headcount vs minimum", expanded=False):
+            rows = []
+            cov = cp1.coverage
+            for day in range(7):
+                min_req = params.min_headcount_per_day[day]
+                if min_req <= 0:
+                    continue
+                s = day * INTERVALS_PER_DAY
+                e = s + INTERVALS_PER_DAY
+                actual_min = int(cov[s:e].min())
+                rows.append({
+                    "Day": DAY_NAMES[day],
+                    "Min Simultaneous (actual)": actual_min,
+                    "Required Min": min_req,
+                    "Status": "✅" if actual_min >= min_req else "❌ VIOLATION",
+                })
+            if rows:
+                st.dataframe(pd.DataFrame(rows),
+                             use_container_width=True, hide_index=True)
+            else:
+                st.caption("No combined minimum headcount requirements were set.")
 
     # per-occupation daily max simultaneous headcount table
     if params.occ_max_headcount_per_day:
