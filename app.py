@@ -237,31 +237,39 @@ with st.sidebar:
                 sc_dict = {}
                 for code in selected_codes:
                     st.caption(f"  {code}")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.caption("Max per day")
-                        max_daily = []
-                        mx_cols = st.columns(7)
-                        for d in range(7):
-                            with mx_cols[d]:
-                                mx = st.number_input(
-                                    f"max_{i}_{code}_{d}", 0, 500, 0,
-                                    key=f"sc_hc_max_{i}_{code.replace('-','_')}_{d}",
-                                    label_visibility="collapsed",
-                                )
-                                max_daily.append(mx)
-                    with c2:
-                        st.caption("Min per day")
-                        min_daily = []
-                        mn_cols = st.columns(7)
-                        for d in range(7):
-                            with mn_cols[d]:
-                                mn = st.number_input(
-                                    f"min_{i}_{code}_{d}", 0, 500, 0,
-                                    key=f"sc_hc_min_{i}_{code.replace('-','_')}_{d}",
-                                    label_visibility="collapsed",
-                                )
-                                min_daily.append(mn)
+                    max_daily = []
+                    min_daily = []
+                    # Day header row
+                    day_cols = st.columns(7)
+                    for d in range(7):
+                        with day_cols[d]:
+                            st.caption(DAY_SHORT[d])
+                    # Max row
+                    max_cols = st.columns(7)
+                    for d in range(7):
+                        with max_cols[d]:
+                            mx = st.number_input(
+                                f"max_{i}_{code}_{d}", 0, 500, 0,
+                                key=f"sc_hc_max_{i}_{code.replace('-','_')}_{d}",
+                                label_visibility="collapsed",
+                            )
+                            max_daily.append(mx)
+                    # Min row
+                    min_cols = st.columns(7)
+                    for d in range(7):
+                        with min_cols[d]:
+                            mn = st.number_input(
+                                f"min_{i}_{code}_{d}", 0, 500, 0,
+                                key=f"sc_hc_min_{i}_{code.replace('-','_')}_{d}",
+                                label_visibility="collapsed",
+                            )
+                            min_daily.append(mn)
+                    # "Max" / "Min" row labels alongside day columns
+                    lbl_cols = st.columns([1, 1, 1, 1, 1, 1, 1, 0.5])
+                    with lbl_cols[0]:
+                        st.caption("Max →")
+                    with lbl_cols[7]:
+                        st.caption("← Min")
                     has_max = any(v > 0 for v in max_daily)
                     has_min = any(v > 0 for v in min_daily)
                     if has_max or has_min:
