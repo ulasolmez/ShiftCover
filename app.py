@@ -383,18 +383,37 @@ if demands is not None:
     # ── Daily peak demand reference ──────────────────────────────────────
     with st.expander("📊 Daily peak demand by occupation", expanded=True):
         peak_rows = []
+        peak_lookup: dict = {}  # (occ_i, day) -> peak value
         for i, (d, name) in enumerate(zip(demands, stored_names)):
             for day in range(7):
                 s = day * INTERVALS_PER_DAY
                 e = s + INTERVALS_PER_DAY
+                peak_val = int(d[s:e].max())
                 peak_rows.append({
                     "Occupation": name,
                     "Day": DAY_NAMES[day],
-                    "Peak Demand": int(d[s:e].max()),
+                    "Peak Demand": peak_val,
                 })
+                peak_lookup[(i, day)] = peak_val
         if peak_rows:
             st.dataframe(pd.DataFrame(peak_rows),
                          use_container_width=True, hide_index=True)
+
+            _buf_col, _btn_col = st.columns([2, 3])
+            with _buf_col:
+                peak_buffer = st.slider(
+                    "Buffer (add to peak)", 0, 20, 2, 1,
+                    key="peak_buffer",
+                    help="Extra headroom added to each peak demand before setting the limit."
+                )
+            with _btn_col:
+                st.caption("")  # vertical alignment spacer
+                if st.button("📋 Copy peaks to limits", key="copy_peaks_btn",
+                             help="Auto-fill the per-occupation headcount limit boxes "
+                                  "in the sidebar with (peak + buffer) for each day."):
+                    for (i, day), peak in peak_lookup.items():
+                        st.session_state[f"occ_hc_{i}_{day}"] = peak + peak_buffer
+                    st.rerun()
             st.caption("Use these peaks to set **Max headcount per occupation per day** "
                        "limits in the sidebar. Set each occupation's daily cap ≥ its peak demand.")
 
