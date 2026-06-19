@@ -102,14 +102,15 @@ class SolverParams:
     # Each is a list of 7 ints (Mon–Sun). If None → no constraint.
     max_entries_per_day: Optional[List[int]] = None
     max_exits_per_day: Optional[List[int]] = None
-    # Per-day max simultaneous workers (0 = unlimited). List of 7 ints.
+    # Per-day max workers entering shifts (0 = unlimited). List of 7 ints.
+    # Counts total workers whose shift STARTS on that day (entry-based, not simultaneous).
     max_headcount_per_day: Optional[List[int]] = None
-    # Per-day min simultaneous workers combined across ALL occupations (0 = no minimum). List of 7 ints.
+    # Per-day min workers entering shifts combined across ALL occupations (0 = no minimum). List of 7 ints.
     min_headcount_per_day: Optional[List[int]] = None
-    # Per-occupation per-day max simultaneous workers.
+    # Per-occupation per-day max workers entering shifts.
     # List of length n_occ; each element is a list of 7 ints (0 = unlimited) or None.
     occ_max_headcount_per_day: Optional[List[Optional[List[int]]]] = None
-    # Per-occupation per-day min simultaneous workers.
+    # Per-occupation per-day min workers entering shifts.
     # List of length n_occ; each element is a list of 7 ints (0 = no minimum) or None.
     occ_min_headcount_per_day: Optional[List[Optional[List[int]]]] = None
     # Per-occupation per-shift-code per-day max/min workers.
@@ -160,10 +161,10 @@ def peak_daily_simultaneous(p1: PhaseOneResult) -> List[int]:
 
 
 def max_headcount(p1: PhaseOneResult) -> int:
-    """Peak simultaneous workers across the week."""
+    """Max daily entry headcount across the week (sum of workers starting shift each day)."""
     if p1.counts:  # non-empty result
-        peaks = peak_daily_simultaneous(p1)
-        return max(peaks) if peaks else 0
+        entries = daily_entry_headcount(p1)
+        return max(entries) if entries else 0
     return 0
 
 
@@ -330,6 +331,7 @@ def _build_multi_curve_model(
     cov: Dict[int, List[int]],
     shifts: List[CandidateShift],
     n_occ: int,
+    day_shift_idxs: Dict[int, List[int]],
     callback=None,
 ) -> Tuple[cp_model.CpModel, Dict[int, Dict[int, object]], Dict[int, object]]:
     """
@@ -442,7 +444,7 @@ def _build_multi_curve_model(
         if callback:
             callback(f"Max exits/day: {params.max_exits_per_day}")
 
-    # ── Per-occupation daily headcount limits ─────────────────────────────
+    # ── Per-occupation daily headcount limits (entry-based) ───────────────
     if params.occ_max_headcount_per_day:
         for occ in range(n_occ):
             occ_limits = params.occ_max_headcount_per_day[occ]
@@ -452,19 +454,16 @@ def _build_multi_curve_model(
                 limit = occ_limits[day]
                 if limit <= 0:
                     continue
-                day_start = day * INTERVALS_PER_DAY
-                day_end = day_start + INTERVALS_PER_DAY
-                for t in range(day_start, day_end):
-                    covering = cov[t]
-                    if not covering:
-                        continue
-                    model.add(
-                        sum(x[occ][si] for si in covering) <= limit
-                    )
+                idxs = day_shift_idxs[day]
+                if not idxs:
+                    continue
+                model.add(
+                    sum(x[occ][si] for si in idxs) <= limit
+                )
         if callback:
             callback(f"Per-occ headcount limits set for {sum(1 for l in params.occ_max_headcount_per_day if l is not None)} occupation(s)")
 
-    # ── Per-occupation daily minimum headcount ────────────────────────────
+    # ── Per-occupation daily minimum headcount (entry-based) ─────────────
     if params.occ_min_headcount_per_day:
         for occ in range(n_occ):
             occ_mins = params.occ_min_headcount_per_day[occ]
@@ -474,16 +473,12 @@ def _build_multi_curve_model(
                 min_limit = occ_mins[day]
                 if min_limit <= 0:
                     continue
-                day_start = day * INTERVALS_PER_DAY
-                day_end = day_start + INTERVALS_PER_DAY
-                # Enforce min at all intervals within the day
-                for t in range(day_start, day_end):
-                    covering = cov[t]
-                    if not covering:
-                        continue
-                    model.add(
-                        sum(x[occ][si] for si in covering) >= min_limit
-                    )
+                idxs = day_shift_idxs[day]
+                if not idxs:
+                    continue
+                model.add(
+                    sum(x[occ][si] for si in idxs) >= min_limit
+                )
         if callback:
             callback(f"Per-occ min headcount set for {sum(1 for l in params.occ_min_headcount_per_day if l is not None)} occupation(s)")
 
@@ -522,41 +517,35 @@ def _build_multi_curve_model(
             n_constrained = sum(1 for sc in params.occ_headcount_per_shift_code if sc is not None)
             callback(f"Shift-code headcount limits set for {n_constrained} occupation(s)")
 
-    # ── Per-day max simultaneous headcount (combined) ─────────────────────
+    # ── Per-day max headcount (combined, entry-based) ────────────────────
     if params.max_headcount_per_day:
         for day in range(7):
             limit = params.max_headcount_per_day[day]
             if limit <= 0:
                 continue
-            day_start = day * INTERVALS_PER_DAY
-            day_end = day_start + INTERVALS_PER_DAY
-            for t in range(day_start, day_end):
-                covering = cov[t]
-                if not covering:
-                    continue
-                total_at_t = []
-                for occ in range(n_occ):
-                    total_at_t.extend(x[occ][si] for si in covering)
-                model.add(sum(total_at_t) <= limit)
+            idxs = day_shift_idxs[day]
+            if not idxs:
+                continue
+            total_terms = []
+            for occ in range(n_occ):
+                total_terms.extend(x[occ][si] for si in idxs)
+            model.add(sum(total_terms) <= limit)
         if callback:
             callback(f"Max headcount/day: {params.max_headcount_per_day}")
 
-    # ── Per-day min simultaneous headcount (combined) ─────────────────────
+    # ── Per-day min headcount (combined, entry-based) ────────────────────
     if params.min_headcount_per_day:
         for day in range(7):
             min_limit = params.min_headcount_per_day[day]
             if min_limit <= 0:
                 continue
-            day_start = day * INTERVALS_PER_DAY
-            day_end = day_start + INTERVALS_PER_DAY
-            for t in range(day_start, day_end):
-                covering = cov[t]
-                if not covering:
-                    continue
-                total_at_t = []
-                for occ in range(n_occ):
-                    total_at_t.extend(x[occ][si] for si in covering)
-                model.add(sum(total_at_t) >= min_limit)
+            idxs = day_shift_idxs[day]
+            if not idxs:
+                continue
+            total_terms = []
+            for occ in range(n_occ):
+                total_terms.extend(x[occ][si] for si in idxs)
+            model.add(sum(total_terms) >= min_limit)
         if callback:
             callback(f"Min headcount/day: {params.min_headcount_per_day}")
 
@@ -735,9 +724,14 @@ def solve_phase1_multi(
     if callback:
         callback("Built coverage map")
 
+    # Precompute: for each day, list of shift indices that start on that day
+    day_shift_idxs: Dict[int, List[int]] = {d: [] for d in range(7)}
+    for s in shifts:
+        day_shift_idxs[s.day].append(s.idx)
+
     # ── Stage 2: build model ─────────────────────────────────────────────
     model, x, z = _build_multi_curve_model(
-        demands, params, cov, shifts, n_occ, callback)
+        demands, params, cov, shifts, n_occ, day_shift_idxs, callback)
 
     # ── Stage 3: solve ───────────────────────────────────────────────────
     solver, status_code, status_str, elapsed = _solve_cp_sat(model, params, t0)

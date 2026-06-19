@@ -155,8 +155,9 @@ with st.sidebar:
     use_exits = any(v > 0 for v in max_exits)
 
     with st.expander("👥 Headcount limits per day (combined)", expanded=False):
-        st.caption("Max and min simultaneous workers (all occupations combined) "
-                   "per day. 0 = unlimited / no minimum.")
+        st.caption("Max and min workers entering shifts (all occupations combined) "
+                   "per day — counts workers whose shift STARTS on the day. "
+                   "0 = unlimited / no minimum.")
         max_hc = []
         min_hc = []
         for d in range(7):
@@ -175,7 +176,7 @@ with st.sidebar:
     # Per-occupation daily headcount limits
     occ_max_hc: list = []
     with st.expander("👤 Max headcount per occupation per day", expanded=False):
-        st.caption("Set how many workers of each occupation can work simultaneously "
+        st.caption("Set how many workers of each occupation can enter a shift "
                    "per day. 0 = unlimited (use combined limit or no restriction).")
         for i in range(n_curves):
             st.markdown(f"**{occ_names[i]}**")
@@ -198,8 +199,8 @@ with st.sidebar:
     # Per-occupation daily minimum headcount
     occ_min_hc: list = []
     with st.expander("👤 Min headcount per occupation per day", expanded=False):
-        st.caption("Set a minimum number of workers of each occupation that must be "
-                   "working simultaneously per day. 0 = no minimum.")
+        st.caption("Set a minimum number of workers of each occupation that must "
+                   "enter a shift per day. 0 = no minimum.")
         for i in range(n_curves):
             st.markdown(f"**{occ_names[i]}**")
             occ_daily_min = []
@@ -720,23 +721,21 @@ if result is not None:
                 st.metric(f"{occ.name} headcount", occ_hc)
                 st.metric(f"{occ.name} worker-h", f"{occ_wh:,.0f}")
 
-    # combined daily min simultaneous headcount table
+    # combined daily headcount vs minimum table (entry-based)
     if params.min_headcount_per_day:
         with st.expander("👥 Combined daily headcount vs minimum", expanded=False):
             rows = []
-            cov = cp1.coverage
+            daily_entries = daily_entry_headcount(cp1)
             for day in range(7):
                 min_req = params.min_headcount_per_day[day]
                 if min_req <= 0:
                     continue
-                s = day * INTERVALS_PER_DAY
-                e = s + INTERVALS_PER_DAY
-                actual_min = int(cov[s:e].min())
+                actual = daily_entries[day]
                 rows.append({
                     "Day": DAY_NAMES[day],
-                    "Min Simultaneous (actual)": actual_min,
+                    "Workers entering shifts": actual,
                     "Required Min": min_req,
-                    "Status": "✅" if actual_min >= min_req else "❌ VIOLATION",
+                    "Status": "✅" if actual >= min_req else "❌ VIOLATION",
                 })
             if rows:
                 st.dataframe(pd.DataFrame(rows),
@@ -744,7 +743,7 @@ if result is not None:
             else:
                 st.caption("No combined minimum headcount requirements were set.")
 
-    # per-occupation daily max simultaneous headcount table
+    # per-occupation daily headcount vs limit table (entry-based)
     if params.occ_max_headcount_per_day:
         with st.expander("👤 Per-occupation daily headcount vs limit", expanded=False):
             rows = []
@@ -752,18 +751,18 @@ if result is not None:
                 occ_limits = params.occ_max_headcount_per_day[i]
                 if occ_limits is None:
                     continue
-                cov = occ.phase1.coverage
+                daily = daily_entry_headcount(occ.phase1)
                 for day in range(7):
-                    s = day * INTERVALS_PER_DAY
-                    e = s + INTERVALS_PER_DAY
-                    actual_max = int(cov[s:e].max())
                     limit = occ_limits[day]
+                    if limit <= 0:
+                        continue
+                    actual = daily[day]
                     rows.append({
                         "Occupation": occ.name,
                         "Day": DAY_NAMES[day],
-                        "Peak Simultaneous": actual_max,
+                        "Workers entering shifts": actual,
                         "Limit": limit,
-                        "Status": "✅" if actual_max <= limit else "❌ VIOLATION",
+                        "Status": "✅" if actual <= limit else "❌ VIOLATION",
                     })
             if rows:
                 st.dataframe(pd.DataFrame(rows),
@@ -816,7 +815,7 @@ if result is not None:
             else:
                 st.caption("No shift-type headcount constraints were active.")
 
-    # per-occupation daily min simultaneous headcount table
+    # per-occupation daily headcount vs minimum table (entry-based)
     if params.occ_min_headcount_per_day:
         with st.expander("👤 Per-occupation daily headcount vs minimum", expanded=False):
             rows = []
@@ -824,20 +823,18 @@ if result is not None:
                 occ_mins = params.occ_min_headcount_per_day[i]
                 if occ_mins is None:
                     continue
-                cov = occ.phase1.coverage
+                daily = daily_entry_headcount(occ.phase1)
                 for day in range(7):
                     min_req = occ_mins[day]
                     if min_req <= 0:
                         continue
-                    s = day * INTERVALS_PER_DAY
-                    e = s + INTERVALS_PER_DAY
-                    actual_min = int(cov[s:e].min())
+                    actual = daily[day]
                     rows.append({
                         "Occupation": occ.name,
                         "Day": DAY_NAMES[day],
-                        "Min Simultaneous": actual_min,
+                        "Workers entering shifts": actual,
                         "Required Min": min_req,
-                        "Status": "✅" if actual_min >= min_req else "❌ VIOLATION",
+                        "Status": "✅" if actual >= min_req else "❌ VIOLATION",
                     })
             if rows:
                 st.dataframe(pd.DataFrame(rows),
