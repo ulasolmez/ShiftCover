@@ -3,13 +3,10 @@ ShiftCover – Weekly Shift-Covering Optimiser (OR-Tools CP-SAT)
 ==============================================================
 Supports 1-5 occupation curves with SHARED shift structures.
 
-Two-phase solver
-  Phase 1 – Multi-curve Set Covering via CP-SAT.
-             Shift activation (z[s]) is shared across occupations so every
-             occupation's workers enter/exit at the same boundaries
-             (same shuttle schedule).
-  Phase 2 – Per-occupation greedy worker assignment respecting weekly-hour
-             windows and minimum-rest constraints.
+Single-phase solver: Multi-curve Set Covering via CP-SAT.
+Shift activation (z[s]) is shared across occupations so every
+occupation's workers enter/exit at the same boundaries
+(same shuttle schedule).
 """
 
 from __future__ import annotations
@@ -92,9 +89,6 @@ class SolverParams:
     max_shift_hours: float        = 12.0
     shift_start_granularity_min: int = 30
     shift_duration_step_min: int  = 30
-    min_weekly_hours: float       = 40.0
-    max_weekly_hours: float       = 50.0
-    min_rest_hours: float         = 12.0
     max_unique_shifts: int        = 0          # 0 = unlimited
     transition_penalty: int       = 50
     solver_time_limit_sec: int    = 120

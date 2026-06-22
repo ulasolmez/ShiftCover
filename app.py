@@ -132,13 +132,6 @@ with st.sidebar:
         if _conflict:
             st.warning(f"Conflict: {', '.join(sorted(_conflict))} in both lists")
 
-    with st.expander("🕐 Weekly hours", expanded=False):
-        min_wh = st.number_input("Min weekly hours", 20.0, 60.0, 40.0, 1.0)
-        max_wh = st.number_input("Max weekly hours", 20.0, 60.0, 50.0, 1.0)
-
-    with st.expander("👤 Worker constraints", expanded=False):
-        min_rest = st.number_input("Min rest between shifts (h)", 8.0, 24.0, 12.0, 1.0)
-
     DAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
     with st.expander("📅 Entry / Exit limits per day", expanded=False):
@@ -298,9 +291,6 @@ params = SolverParams(
     max_shift_hours=max_shift,
     shift_start_granularity_min=30,
     shift_duration_step_min=30,
-    min_weekly_hours=min_wh,
-    max_weekly_hours=max_wh,
-    min_rest_hours=min_rest,
     max_unique_shifts=max_unique,
     transition_penalty=t_penalty,
     solver_time_limit_sec=time_limit,
@@ -544,10 +534,6 @@ if demands is not None:
     _warnings: list[str] = []
     if min_shift > max_shift:
         _warnings.append("Min shift hours > Max shift hours")
-    if min_wh > max_wh:
-        _warnings.append("Min weekly hours > Max weekly hours")
-    if min_rest + min_shift > 24:
-        _warnings.append("Min rest + Min shift > 24 h — no two shifts can fit in one day")
     for w in _warnings:
         st.warning(w)
 
@@ -588,8 +574,6 @@ if result is not None:
             "The model has no feasible solution with the current settings. "
             "Try relaxing one or more constraints:\n"
             "- Widen the shift-duration range (lower min / raise max)\n"
-            "- Reduce minimum weekly hours or raise maximum weekly hours\n"
-            "- Lower minimum rest hours between shifts\n"
             "- Remove or loosen entry / exit / headcount limits\n"
             "- Uncheck *Exclude night shifts* if demand peaks at night\n"
             "- Increase the solver time limit (the solver may need more time)"
