@@ -43,7 +43,16 @@ def _load_config() -> dict[str, Any] | None:
 
 def _env(key: str, default: str = "") -> str:
     """Read from env, then Streamlit secrets, then default."""
-    return os.getenv(key) or st.secrets.get(key, default)
+    val = os.getenv(key)
+    if val:
+        return val
+    try:
+        val = st.secrets.get(key)
+        if val:
+            return val
+    except Exception:
+        pass
+    return default
 
 
 # ===========================================================================
