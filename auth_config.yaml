@@ -1,0 +1,48 @@
+# ──────────────────────────────────────────────────────────────────────
+# Simplex – Authentication Configuration
+# ──────────────────────────────────────────────────────────────────────
+# Copy this file to auth_config.yaml and edit to enable authentication.
+# Secrets (passwords, tokens, keys) should be set via environment
+# variables or Streamlit secrets, NOT hard-coded here.
+#
+# Environment variables used by this module:
+#   AZURE_TENANT_ID   – Microsoft Entra tenant (directory) ID
+#   AZURE_CLIENT_ID   – Enterprise application (client) ID
+#   AZURE_CLIENT_SECRET – (optional) for confidential clients
+# ──────────────────────────────────────────────────────────────────────
+
+# ── Azure AD / Microsoft Entra ID ───────────────────────────────────
+azure:
+  # These can also be set via AZURE_TENANT_ID / AZURE_CLIENT_ID env vars.
+  # Leave empty here if you prefer environment variables.
+  tenant_id: ""         # e.g. "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+  client_id: ""         # e.g. "12345678-90ab-cdef-1234-567890abcdef"
+  redirect_uri: "http://localhost:8501/"
+
+  # Role assigned to any authenticated user who does NOT match a mapped
+  # group or app role below.
+  default_role: user
+
+  # Map Azure AD group object IDs or app role names to local roles.
+  # Examples:
+  #   "00000000-0000-0000-0000-000000000000": admin
+  #   "ShiftCover.Admins": admin
+  role_mapping: {}
+    # "": admin
+
+# ── Local users (fallback when Azure is unavailable / for testing) ───
+# Password hashes can be:
+#   - SHA-256 hex (e.g. "5e884898..." for "password")
+#   - bcrypt ($2b$... or $2a$...)  if `bcrypt` package is installed
+#
+# Generate SHA-256:  python -c "import hashlib;print(hashlib.sha256(b'yourpass').hexdigest())"
+# Generate bcrypt:   python -c "import bcrypt;print(bcrypt.hashpw(b'yourpass', bcrypt.gensalt()).decode())"
+users:
+  admin:
+    name: "Administrator"
+    password_hash: "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"  # "password"
+    role: admin
+  viewer:
+    name: "Viewer User"
+    password_hash: "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"  # "password"
+    role: viewer

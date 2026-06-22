@@ -21,9 +21,14 @@ from solver import (
     daily_entry_headcount, max_headcount,
 )
 from sample_data import generate_sample_demand
+from auth import require_login, render_sidebar_user, get_user, is_admin
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Simplex", layout="wide")
+
+# ── Authentication ───────────────────────────────────────────────────────────
+require_login()
+
 st.title("🕐 Simplex – Weekly Shift Optimiser")
 
 # ── Handle auto-fill from demand peaks (must run BEFORE sidebar widgets) ─────
@@ -313,6 +318,8 @@ params = SolverParams(
     allowed_slot_minutes=allowed_slot_minutes,
 )
 
+# ── Show current user in sidebar ─────────────────────────────────────────────
+render_sidebar_user()
 
 # ── Helper: parse uploaded demand file ───────────────────────────────────────
 def _parse_demand_file(uploaded, required_len=TOTAL_INTERVALS):
