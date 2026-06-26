@@ -63,7 +63,7 @@ with st.sidebar:
         min_shift = st.slider("Min shift (h)", 3.0, 8.0, 3.0, 0.5)
         max_shift = st.slider("Max shift (h)", 6.0, 12.0, 12.0, 0.5)
         max_unique = st.number_input("Max unique shifts (0 = unlimited)", 0, 200, 0)
-        no_night = st.checkbox("Exclude night shifts (≥8 h with >50 % in 20:00–06:00)", value=False)
+        no_night = st.checkbox("Exclude night shifts (>8.5 h with ≥50 % in 20:00–06:00)", value=False)
         circular = st.checkbox("Circular week (Sunday → Monday)", value=False)
 
         _ALL_SLOTS = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]

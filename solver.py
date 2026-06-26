@@ -228,12 +228,12 @@ def effective_hours(duration_hours: float) -> float:
 
 
 def is_night_shift(start: int, dur: int) -> bool:
-    """True when duration ≥ 8 h AND night overlap > half the shift duration."""
+    """True when duration > 8.5 h AND night overlap >= half the shift duration."""
     dur_h = dur / INTERVALS_PER_HOUR
-    if dur_h < 8.0:
+    if dur_h <= 8.5:
         return False
     night_h = night_overlap_hours(start, start + dur)
-    return night_h > dur_h / 2.0
+    return night_h >= dur_h / 2.0
 
 
 # ── Candidate-shift generation ───────────────────────────────────────────────

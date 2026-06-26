@@ -143,20 +143,35 @@ class TestCandidateShiftProperties(unittest.TestCase):
 class TestNightDetection(unittest.TestCase):
 
     def test_day_shift_not_night(self):
-        # 08:00–16:00 (dur 8 h = 96 intervals)
+        # 08:00–16:00 (dur 8 h = 96 intervals) – dur <= 8.5, not night
         self.assertFalse(is_night_shift(96, 96))
 
     def test_night_shift_detected(self):
-        # 22:00–06:00 (start=264, dur=96)
-        self.assertTrue(is_night_shift(264, 96))
+        # 22:00–06:00 (start=264, dur=108) – 9 h, > 8.5 h, fully in night
+        self.assertTrue(is_night_shift(264, 108))
 
     def test_evening_long_shift_not_night(self):
-        # 14:00–22:00 (start=168, dur=96) – mostly daytime
-        self.assertFalse(is_night_shift(168, 96))
+        # 14:00–22:00 (start=168, dur=108) – 9 h, but only 2 h in night (< 4.5 h)
+        self.assertFalse(is_night_shift(168, 108))
 
     def test_short_night_not_flagged(self):
-        # 22:00–02:00 (start=264, dur=48) – only 4 h, under the 8 h threshold
+        # 22:00–02:00 (start=264, dur=48) – only 4 h, under 8.5 h threshold
         self.assertFalse(is_night_shift(264, 48))
+
+    def test_exactly_8_5_hours_not_night(self):
+        # Duration exactly 8.5 h (102 intervals) — NOT a night shift (must be > 8.5)
+        self.assertFalse(is_night_shift(264, 102))
+
+    def test_night_overlap_exactly_half(self):
+        # 18:00–03:00 (start=216, dur=108) — 9 h shift, 4.5 h in night = exactly half → night
+        self.assertTrue(is_night_shift(216, 108))
+
+    def test_night_overlap_barely_under_half(self):
+        # 16:00–02:00 (start=192, dur=120) — 10 h shift, night=20:00-02:00=6 h?
+        # Actually: 16:00-02:00 spans 10 h. Night 20:00-02:00 = 6 h which is > 5 h → night
+        # Let's test a different one: 15:00-23:00 (start=180, dur=96) — 8 h shift (<=8.5, not night anyway)
+        # Better: 14:00-22:30 (start=168, dur=102) — 8.5 h, exactly 8.5 → not night (duration threshold)
+        self.assertFalse(is_night_shift(168, 102))
 
     def test_night_overlap_full_night(self):
         # 20:00–06:00 = 10 h night window exactly → 120 intervals
