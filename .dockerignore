@@ -1,0 +1,10 @@
+__pycache__
+*.pyc
+*.pyo
+.venv
+.git
+.gitignore
+*.md
+test_*.py
+sample_data.py
+sample_demand.csv
