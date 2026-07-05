@@ -482,7 +482,7 @@ if demands is not None:
     fig_d.update_xaxes(tickvals=tick_vals, ticktext=DAY_NAMES)
     fig_d.update_layout(height=300, margin=dict(l=40, r=20, t=30, b=30),
                         legend=dict(orientation="h", y=1.12))
-    st.plotly_chart(fig_d, use_container_width=True)
+    st.plotly_chart(fig_d, width="stretch")
 
 
 # ── Solve ────────────────────────────────────────────────────────────────────
@@ -504,7 +504,7 @@ if demands is not None:
                 peak_lookup[(i, day)] = peak_val
         if peak_rows:
             st.dataframe(pd.DataFrame(peak_rows),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
 
             _buf_col, _btn_col = st.columns([2, 3])
             with _buf_col:
@@ -553,7 +553,14 @@ if demands is not None:
             log_box.code("\n".join(log_lines), language="text")
 
         with st.spinner("Solving …"):
-            result = solve_multi(demands, stored_names, params, callback=_cb)
+            try:
+                result = solve_multi(demands, stored_names, params, callback=_cb)
+            except MemoryError:
+                st.error("Out of memory — try reducing the number of occupations or shortening the time limit.")
+                st.stop()
+            except Exception as exc:
+                st.error(f"Solver crashed: {exc}")
+                st.stop()
 
         # stash previous before overwriting
         if "result" in st.session_state:
@@ -655,7 +662,7 @@ if result is not None:
             if _param_rows:
                 st.caption("**Settings changed:**")
                 st.dataframe(pd.DataFrame(_param_rows),
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
             else:
                 st.caption("Settings unchanged.")
 
@@ -739,7 +746,7 @@ if result is not None:
                 })
             if rows:
                 st.dataframe(pd.DataFrame(rows),
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
             else:
                 st.caption("No combined minimum headcount requirements were set.")
 
@@ -766,7 +773,7 @@ if result is not None:
                     })
             if rows:
                 st.dataframe(pd.DataFrame(rows),
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
             else:
                 st.caption("No per-occupation headcount limits were set.")
 
@@ -811,7 +818,7 @@ if result is not None:
                             })
             if rows:
                 st.dataframe(pd.DataFrame(rows),
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
             else:
                 st.caption("No shift-type headcount constraints were active.")
 
@@ -838,7 +845,7 @@ if result is not None:
                     })
             if rows:
                 st.dataframe(pd.DataFrame(rows),
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
             else:
                 st.caption("No per-occupation minimum headcount requirements were set.")
 
@@ -885,7 +892,7 @@ if result is not None:
     fig_w.update_xaxes(tickvals=tick_vals, ticktext=DAY_NAMES)
     fig_w.update_layout(height=400, margin=dict(l=40, r=20, t=30, b=30),
                         legend=dict(orientation="h", y=1.15))
-    st.plotly_chart(fig_w, use_container_width=True)
+    st.plotly_chart(fig_w, width="stretch")
 
     # ── Daily coverage chart (dropdown) ──────────────────────────────────
     st.subheader("Daily coverage")
@@ -970,7 +977,7 @@ if result is not None:
                          tickangle=45)
     fig_day.update_layout(height=400, margin=dict(l=40, r=20, t=30, b=50),
                           legend=dict(orientation="h", y=1.12))
-    st.plotly_chart(fig_day, use_container_width=True)
+    st.plotly_chart(fig_day, width="stretch")
 
     # ── Shift Types ──────────────────────────────────────────────────────
     st.subheader("Shift types")
@@ -980,7 +987,7 @@ if result is not None:
         all_st.append(st_df)
     if all_st:
         combined_st = pd.concat(all_st, ignore_index=True)
-        st.dataframe(combined_st, use_container_width=True, hide_index=True)
+        st.dataframe(combined_st, width="stretch", hide_index=True)
 
     # ── XLSX download ────────────────────────────────────────────────────
     st.subheader("📥 Download report")

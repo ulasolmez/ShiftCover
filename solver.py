@@ -603,7 +603,7 @@ def _solve_cp_sat(
     """
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = params.solver_time_limit_sec
-    solver.parameters.num_workers = 8
+    solver.parameters.num_workers = 4
     solver.parameters.log_search_progress = False
 
     status_code = solver.solve(model)
