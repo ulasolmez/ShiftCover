@@ -47,8 +47,11 @@ d5 = flat_demand(4,  8, 10)
 demands_all = [d1, d2, d3, d4, d5]
 
 combined_max = [80]*7
+# Technician demand spans 06:00-20:00 (14 h) with a 12 h max shift, so it
+# needs >= 2 crews x 12 = 24 entries/day; the old cap of 20 was infeasible
+# after headcount became entry-based.
 occ_max = [
-    [20]*7, [16]*7, [14]*7, [10]*7, [10]*7,
+    [26]*7, [16]*7, [14]*7, [10]*7, [10]*7,
 ]
 occ_shift_code = [
     {"0800-1600": {"max": [10]*7}, "0600-1400": {"min": [2]*7}},

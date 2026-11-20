@@ -33,7 +33,8 @@ DAY_NAMES = [
     "Friday", "Saturday", "Sunday",
 ]
 DAY_ABBR = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
-OCC_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]  # blue, orange, green, red, purple
+OCC_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+              "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
 
 
 # ── Data classes ─────────────────────────────────────────────────────────────
@@ -445,6 +446,15 @@ def _build_multi_curve_model(
             vals = [v for v in params.occ_min_headcount_per_day[occ] if v > 0]
             if vals:
                 bound = max(bound, max(vals))
+        # Combined daily minimum may have to be met by a single shift
+        if params.min_headcount_per_day:
+            bound = max(bound, max(params.min_headcount_per_day))
+        # Shift-code minimums apply to one (day, code) variable directly
+        if (params.occ_headcount_per_shift_code
+                and params.occ_headcount_per_shift_code[occ]):
+            for spec in params.occ_headcount_per_shift_code[occ].values():
+                if isinstance(spec, dict) and spec.get("min"):
+                    bound = max(bound, max(spec["min"]))
         for s in shifts:
             x[occ][s.idx] = model.new_int_var(0, bound, f"x_{occ}_{s.idx}")
 
@@ -473,11 +483,22 @@ def _build_multi_curve_model(
         if callback:
             callback(f"Force-include {len(code_to_idxs)} shift code(s)")
 
-    # ── Max unique shifts ─────────────────────────────────────────────────
+    # ── Max unique shifts (distinct shift CODES across the week) ──────────
+    # A code such as 0800-1600 used on all 7 days counts once, matching the
+    # "Shift types" table and the ERP Shifttype export.
     if params.max_unique_shifts > 0:
-        model.add(sum(z[s.idx] for s in shifts) <= params.max_unique_shifts)
+        code_idxs: Dict[str, List[int]] = defaultdict(list)
+        for s in shifts:
+            code_idxs[s.shift_code].append(s.idx)
+        u_vars = []
+        for code, idxs in code_idxs.items():
+            u = model.new_bool_var(f"code_{code}")
+            for i in idxs:
+                model.add_implication(z[i], u)
+            u_vars.append(u)
+        model.add(sum(u_vars) <= params.max_unique_shifts)
         if callback:
-            callback(f"Max unique shifts ≤ {params.max_unique_shifts}")
+            callback(f"Max unique shift codes ≤ {params.max_unique_shifts}")
 
     # ── Per-day max distinct entry times ──────────────────────────────────
     if params.max_entries_per_day:
@@ -505,10 +526,19 @@ def _build_multi_curve_model(
 
     # ── Per-day max distinct exit times ───────────────────────────────────
     if params.max_exits_per_day:
-        day_ends: Dict[int, set] = {d: set() for d in range(7)}
+        # Group exits by the day the worker actually LEAVES (the day of the
+        # last worked interval) and the clock time of the exit.  A Mon
+        # 20:00–06:00 shift is a Tuesday 06:00 exit, so it shares that exit
+        # time with Tuesday's other 06:00 exits.  A 16:00–24:00 shift stays a
+        # 24:00 exit on its own day.  Sunday-wrap exits land on Monday.
+        def _exit_key(s):
+            last = (s.global_end - 1) % TOTAL_INTERVALS
+            ed = last // INTERVALS_PER_DAY
+            return ed, last % INTERVALS_PER_DAY + 1
+        day_ends: Dict[int, Dict[int, List[int]]] = {d: defaultdict(list) for d in range(7)}
         for s in shifts:
-            end_ivl = s.start_interval + s.duration_intervals
-            day_ends[s.day].add(end_ivl)
+            ed, ei = _exit_key(s)
+            day_ends[ed][ei].append(s.idx)
         for day in range(7):
             limit = params.max_exits_per_day[day]
             if limit <= 0:
@@ -519,9 +549,7 @@ def _build_multi_curve_model(
             x_vars = []
             for ei in ends:
                 ev = model.new_bool_var(f"exit_d{day}_e{ei}")
-                matching = [s.idx for s in shifts
-                            if s.day == day
-                            and s.start_interval + s.duration_intervals == ei]
+                matching = day_ends[day][ei]
                 model.add(sum(z[idx] for idx in matching) >= 1).only_enforce_if(ev)
                 model.add(sum(z[idx] for idx in matching) == 0).only_enforce_if(ev.negated())
                 x_vars.append(ev)
