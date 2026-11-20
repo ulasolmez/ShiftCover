@@ -130,6 +130,81 @@ class SolverParams:
     # Shifts are only generated when BOTH start and end fall in this set.
     # None = all times allowed.
     allowed_slot_minutes: Optional[List[int]] = None
+    # ── Operational buffers (minutes, 0 = off) ───────────────────────────
+    # prep_lead_min:   workers must be ON SHIFT this long before workload
+    #                  rises (briefing, equipment pickup, walking to stand).
+    #                  E.g. operation starts 08:30, lead 30 → shift starts 08:00.
+    # exit_lag_min:    workers stay this long after workload drops
+    #                  (close-out, equipment return).  Op ends 17:00 → 17:30.
+    # handover_overlap_min: an outgoing worker and their replacement overlap
+    #                  this long while the operation continues.  A newcomer
+    #                  only counts toward coverage after this overlap, so a
+    #                  leaver at 14:00 is replaced by someone starting ≤13:30.
+    # Effective entry lead before a workload rise is max(prep, handover).
+    prep_lead_min: int = 0
+    exit_lag_min: int = 0
+    handover_overlap_min: int = 0
+
+
+# ── Operational buffer helpers ───────────────────────────────────────────────
+def _min_to_intervals(minutes: int) -> int:
+    return max(0, int(round(minutes / 5)))
+
+
+def productive_offset_intervals(params: SolverParams) -> int:
+    """Intervals at the start of each shift that do NOT count as coverage.
+
+    This is the handover overlap: a newcomer must overlap the person they
+    relieve before taking over, so they are only "productive" after it.
+    """
+    off = _min_to_intervals(params.handover_overlap_min)
+    min_dur = int(params.min_shift_hours * INTERVALS_PER_HOUR)
+    return min(off, max(0, min_dur - 1))
+
+
+def required_curve(demand: np.ndarray, params: SolverParams) -> np.ndarray:
+    """Demand dilated by the prep lead and exit lag.
+
+    required[t] = max(demand[t - exit_lag .. t + extra_lead]) where
+    extra_lead = prep_lead - handover_overlap (the handover offset already
+    supplies that much lead, because a shift's first ``handover`` minutes
+    do not count as coverage).
+
+    The result is the number of *productive* workers needed at each interval.
+    """
+    lead = max(0, _min_to_intervals(params.prep_lead_min)
+               - productive_offset_intervals(params))
+    lag = _min_to_intervals(params.exit_lag_min)
+    d = np.asarray(demand)
+    if lead == 0 and lag == 0:
+        return d.copy()
+    n = len(d)
+    out = d.copy()
+    for k in range(1, lead + 1):          # look ahead → be there early
+        if params.circular_week:
+            out = np.maximum(out, np.roll(d, -k))
+        else:
+            shifted = np.zeros_like(d)
+            shifted[:n - k] = d[k:]
+            out = np.maximum(out, shifted)
+    for k in range(1, lag + 1):           # look back → stay late
+        if params.circular_week:
+            out = np.maximum(out, np.roll(d, k))
+        else:
+            shifted = np.zeros_like(d)
+            shifted[k:] = d[:n - k]
+            out = np.maximum(out, shifted)
+    return out
+
+
+def _productive_range(s: "CandidateShift", offset: int, circular: bool) -> range:
+    """Global interval range in which shift ``s`` counts toward coverage."""
+    start = s.global_start
+    # Non-circular week: a shift starting Monday 00:00 is assumed to have
+    # done its handover before the planning horizon.
+    if not (start == 0 and not circular):
+        start += offset
+    return range(start, s.global_end)
 
 
 @dataclass
@@ -181,6 +256,9 @@ class MultiCurveResult:
     combined_phase1: PhaseOneResult
     combined_demand: np.ndarray
     params: SolverParams
+    # Demand after prep-lead / exit-lag dilation (productive staff needed).
+    # None when no buffers are configured.
+    combined_required: Optional[np.ndarray] = None
 
 
 # backward-compat alias
@@ -313,10 +391,17 @@ def generate_candidate_shifts(params: SolverParams) -> List[CandidateShift]:
 
 def build_coverage_map(
     shifts: List[CandidateShift],
+    productive_offset: int = 0,
+    circular: bool = False,
 ) -> Dict[int, List[int]]:
+    """Map interval → shifts that count as (productive) coverage there.
+
+    With ``productive_offset`` > 0 the first N intervals of each shift are
+    handover/prep time and are excluded.
+    """
     cov: Dict[int, List[int]] = {t: [] for t in range(TOTAL_INTERVALS)}
     for s in shifts:
-        for t in range(s.global_start, s.global_end):
+        for t in _productive_range(s, productive_offset, circular):
             cov[t % TOTAL_INTERVALS].append(s.idx)
     return cov
 
@@ -720,9 +805,20 @@ def solve_phase1_multi(
     if callback:
         callback(f"Generated {len(shifts):,} candidate shifts")
 
-    cov = build_coverage_map(shifts)
+    offset = productive_offset_intervals(params)
+    cov = build_coverage_map(shifts, offset, params.circular_week)
     if callback:
         callback("Built coverage map")
+
+    # Apply prep-lead / exit-lag buffers to the workload curves
+    req_demands = [required_curve(d, params) for d in demands]
+    if callback and (params.prep_lead_min or params.exit_lag_min
+                     or params.handover_overlap_min):
+        callback(f"Operational buffers: prep {params.prep_lead_min} min, "
+                 f"exit {params.exit_lag_min} min, "
+                 f"handover {params.handover_overlap_min} min "
+                 f"(+{sum(r.sum() - d.sum() for r, d in zip(req_demands, demands)) / INTERVALS_PER_HOUR:,.0f} "
+                 f"required worker-hours)")
 
     # Precompute: for each day, list of shift indices that start on that day
     day_shift_idxs: Dict[int, List[int]] = {d: [] for d in range(7)}
@@ -731,7 +827,7 @@ def solve_phase1_multi(
 
     # ── Stage 2: build model ─────────────────────────────────────────────
     model, x, z = _build_multi_curve_model(
-        demands, params, cov, shifts, n_occ, day_shift_idxs, callback)
+        req_demands, params, cov, shifts, n_occ, day_shift_idxs, callback)
 
     # ── Stage 3: solve ───────────────────────────────────────────────────
     solver, status_code, status_str, elapsed = _solve_cp_sat(model, params, t0)
@@ -759,8 +855,12 @@ def solve_multi(
         OccupationResult(n, d, p)
         for n, d, p in zip(occ_names, demands, per_occ_p1)
     ]
+    has_buffers = bool(params.prep_lead_min or params.exit_lag_min
+                       or params.handover_overlap_min)
+    combined_req = (sum(required_curve(d, params) for d in demands)
+                    if has_buffers else None)
     return MultiCurveResult(occ_results, combined_p1,
-                            sum(demands), params)
+                            sum(demands), params, combined_req)
 
 
 def solve(
@@ -770,6 +870,50 @@ def solve(
 ) -> MultiCurveResult:
     """Backward-compatible single-curve wrapper."""
     return solve_multi([demand], ["Staff"], params, callback)
+
+
+# ── Buffer verification ─────────────────────────────────────────────────────
+def productive_coverage(p1: PhaseOneResult, params: SolverParams) -> np.ndarray:
+    """Workers past their handover overlap at each interval."""
+    off = productive_offset_intervals(params)
+    cov = np.zeros(TOTAL_INTERVALS, dtype=int)
+    for s, cnt in zip(p1.shifts, p1.counts):
+        if cnt > 0:
+            for t in _productive_range(s, off, params.circular_week):
+                cov[t % TOTAL_INTERVALS] += cnt
+    return cov
+
+
+def buffer_violations(result: "MultiCurveResult",
+                      params: Optional[SolverParams] = None) -> Dict[str, object]:
+    """Check every occupation against its prep / exit / handover requirement.
+
+    ``params`` defaults to the params the result was solved with; pass other
+    params to score a schedule against a different buffer rule.
+
+    Returns dict with total violating intervals, short worker-hours and a
+    per-occupation breakdown.  All zeros → buffers fully respected.
+    """
+    params = params or result.params
+    per_occ = {}
+    tot_iv, tot_short = 0, 0
+    for occ in result.occupations:
+        req = required_curve(occ.demand, params)
+        prod = productive_coverage(occ.phase1, params)
+        short = np.maximum(req - prod, 0)
+        n_iv = int(np.count_nonzero(short))
+        per_occ[occ.name] = {"intervals": n_iv,
+                             "short_wh": float(short.sum()) / INTERVALS_PER_HOUR}
+        tot_iv += n_iv
+        tot_short += int(short.sum())
+    return {"intervals": tot_iv,
+            "short_wh": tot_short / INTERVALS_PER_HOUR,
+            "per_occupation": per_occ}
+
+
+def fte(p1: PhaseOneResult, weekly_hours: float = 45.0) -> float:
+    """Full-time equivalents = paid worker-hours / weekly contract hours."""
+    return p1.total_worker_intervals / INTERVALS_PER_HOUR / weekly_hours
 
 
 # ── Result → DataFrames ─────────────────────────────────────────────────────
@@ -809,6 +953,8 @@ def coverage_dataframe(result: MultiCurveResult) -> pd.DataFrame:
         "TotalDemand": result.combined_demand.astype(int),
         "TotalCoverage": result.combined_phase1.coverage.astype(int),
     }
+    if result.combined_required is not None:
+        data["TotalRequired_withBuffers"] = result.combined_required.astype(int)
     for occ in result.occupations:
         data[f"Demand_{occ.name}"]    = occ.demand.astype(int)
         data[f"Coverage_{occ.name}"]  = occ.phase1.coverage.astype(int)
