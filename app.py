@@ -23,6 +23,8 @@ from solver import (
 )
 from sample_data import generate_sample_demand
 from groundstar_import import read_workload_file, curve_week, combine_by_occupation
+from roster import (RosterParams, slots_from_phase1, solve_roster, precheck,
+                    verify_roster, OFF_MODES)
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Simplex", layout="wide")
@@ -137,12 +139,38 @@ with st.sidebar:
         if _conflict:
             st.warning(f"Conflict: {', '.join(sorted(_conflict))} in both lists")
 
-    with st.expander("🕐 Weekly hours", expanded=False):
-        min_wh = st.number_input("Min weekly hours", 20.0, 60.0, 40.0, 1.0)
-        max_wh = st.number_input("Max weekly hours", 20.0, 60.0, 50.0, 1.0)
-
-    with st.expander("👤 Worker constraints", expanded=False):
-        min_rest = st.number_input("Min rest between shifts (h)", 8.0, 24.0, 12.0, 1.0)
+    with st.expander("👥 Roster (people needed)", expanded=True):
+        build_roster = st.checkbox("Build roster after planning shifts", value=True,
+                                   help="Assigns every planned shift to a person to "
+                                        "get the real headcount.")
+        _off_labels = {
+            "1": "1 off — ≤ 6 shifts, one rest ≥ 24 h",
+            "1.5": "1.5 off — half 1-off / half 2-off (alternating weeks)",
+            "2": "2 off — ≤ 5 shifts",
+            "auto": "Auto — solver picks 1 or 2 off per person",
+        }
+        off_mode = st.selectbox("Days off per week", OFF_MODES, index=2,
+                                format_func=_off_labels.get)
+        target_wh = st.number_input("Target paid hours / week", 20.0, 60.0, 45.0, 0.5,
+                                    help="Hours are balanced towards this. In 1.5-off "
+                                         "mode the two-week average hits it.")
+        min_wh, max_wh = st.slider("Paid hours window / week", 20.0, 70.0, (40.0, 50.0), 0.5,
+                                   help="Max is a hard limit; falling below min is "
+                                        "allowed but minimised and reported.")
+        min_rest = st.number_input("Min rest between shifts (h)", 8.0, 24.0, 12.0, 0.5,
+                                   help="Exactly this much is allowed (≥).")
+        off_rest = st.number_input("1-off weekly rest (h)", 12.0, 48.0, 24.0, 0.5,
+                                   help="A 1-off person needs one rest at least this "
+                                        "long somewhere in the week.")
+        allow_pt = st.checkbox("Allow part-time staff", value=False)
+        if allow_pt:
+            pt_min, pt_max = st.slider("Part-time paid hours / week", 5.0, 40.0,
+                                       (20.0, 30.0), 0.5)
+            pt_shifts = st.number_input("Part-time max shifts / week", 1, 6, 4)
+        else:
+            pt_min, pt_max, pt_shifts = 20.0, 30.0, 4
+        roster_time = st.number_input("Roster time limit per occupation (s)",
+                                      10, 1800, 60, 10)
 
     DAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -313,6 +341,13 @@ with st.sidebar:
     with st.expander("🔧 Solver", expanded=False):
         time_limit = st.number_input("Time limit (s)", 10, 600, 120, 10)
         t_penalty = st.number_input("Transition penalty", 0, 500, 50, 10)
+
+roster_params = RosterParams(
+    off_mode=off_mode, target_hours=target_wh, min_hours=min_wh, max_hours=max_wh,
+    min_rest_hours=min_rest, off_rest_hours=off_rest, allow_part_time=allow_pt,
+    pt_min_hours=pt_min, pt_max_hours=pt_max, pt_max_shifts=int(pt_shifts),
+    circular_week=circular, time_limit_sec=float(roster_time),
+)
 
 params = SolverParams(
     min_shift_hours=min_shift,
@@ -566,10 +601,8 @@ if demands is not None:
     _warnings: list[str] = []
     if min_shift > max_shift:
         _warnings.append("Min shift hours > Max shift hours")
-    if min_wh > max_wh:
-        _warnings.append("Min weekly hours > Max weekly hours")
-    if min_rest + min_shift > 24:
-        _warnings.append("Min rest + Min shift > 24 h — no two shifts can fit in one day")
+    if target_wh > max_wh:
+        _warnings.append(f"Target hours {target_wh:g} > max {max_wh:g} — target can't be reached")
     for w in _warnings:
         st.warning(w)
 
@@ -591,12 +624,104 @@ if demands is not None:
                 st.error(f"Solver crashed: {exc}")
                 st.stop()
 
+        rosters = {}
+        if build_roster and result.combined_phase1.status in ("OPTIMAL", "FEASIBLE"):
+            with st.spinner("Building roster …"):
+                for occ in result.occupations:
+                    sl = slots_from_phase1(occ.phase1)
+                    try:
+                        rosters[occ.name] = (solve_roster(sl, roster_params, occ.name,
+                                                          callback=_cb), sl)
+                    except Exception as exc:
+                        st.error(f"Roster for {occ.name} crashed: {exc}")
+        st.session_state["rosters"] = rosters
+
         # stash previous before overwriting
         if "result" in st.session_state:
             st.session_state["prev_result"] = st.session_state["result"]
             st.session_state["prev_result_params"] = st.session_state.get("result_params")
         st.session_state["result"] = result
         st.session_state["result_params"] = params
+
+
+# ── Roster rendering ─────────────────────────────────────────────────────────
+def _roster_table(r):
+    rows = []
+    for q in r.people:
+        row = {"Person": q.pid, "Type": q.kind}
+        for d, t in enumerate(q.shifts):
+            row[DAY_NAMES[d][:3]] = t.code if t is not None else "off"
+        row["Shifts"] = q.n_shifts
+        row["Paid h"] = round(q.paid_hours, 1)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _render_roster(rosters, result):
+    if not rosters:
+        return
+    st.subheader("👥 Roster — people needed")
+    rp = next(iter(rosters.values()))[0].params
+    tot = sum(r.headcount for r, _ in rosters.values())
+    lb = sum(r.lower_bound for r, _ in rosters.values())
+    allp = [q for r, _ in rosters.values() for q in r.people]
+    n1 = sum(1 for q in allp if q.kind == "FT 1-off")
+    n2 = sum(1 for q in allp if q.kind == "FT 2-off")
+    npt = sum(1 for q in allp if q.kind == "PT")
+    hrs = [q.paid_hours for q in allp] or [0]
+    c = st.columns(6)
+    c[0].metric("People", tot, help="Distinct people to work every planned shift.")
+    c[1].metric("Lower bound", lb, help="No roster can use fewer people: max of "
+                "hours ÷ max hours, shifts ÷ shifts per person, busiest day, and "
+                "consecutive days under the rest rule (late finishers can't take "
+                "next morning's shifts). People = bound means the roster is optimal.")
+    c[2].metric("FT 1-off / 2-off", f"{n1} / {n2}")
+    c[3].metric("Part-time", npt)
+    c[4].metric("Avg paid h", f"{np.mean(hrs):.1f}")
+    c[5].metric("Paid h range", f"{min(hrs):.1f}–{max(hrs):.1f}")
+
+    for name, (r, sl) in rosters.items():
+        label = (f"{name}: {r.headcount} people (lower bound {r.lower_bound}) · "
+                 f"{r.status} · {r.elapsed_sec:.0f}s")
+        with st.expander(label, expanded=len(rosters) == 1):
+            if not r.people:
+                st.error(f"No roster: {r.status}. {r.message}")
+                continue
+            errs = verify_roster(r, sl)
+            if errs:
+                st.error("Roster check failed: " + "; ".join(errs[:5]))
+            else:
+                st.success(f"✅ Rules respected — rest ≥ {rp.min_rest_hours:g} h, "
+                           f"1-off rest ≥ {rp.off_rest_hours:g} h, shift and hours limits.")
+            lbs = ", ".join(f"{k} {v}" for k, v in r.lower_bounds.items())
+            _gap = r.headcount - r.lower_bound
+            st.caption(f"Lower bounds: {lbs}. " + (
+                "Roster is at the bound — proven minimum." if _gap == 0 else
+                f"Gap to bound: {_gap} — a longer roster time limit may close it; "
+                f"the 1-off 24 h rule can also keep it above the bound."))
+            for msg in precheck(sl, rp):
+                st.warning(msg)
+            under = r.under_min()
+            if under:
+                avg_paid = sum(t.paid * t.count for t in sl) / max(1, sum(t.count for t in sl)) / 60
+                st.info(
+                    f"{len(under)} of {r.headcount} people are below their minimum hours. "
+                    f"The plan's shifts average {avg_paid:.1f} paid h, so 5 shifts ≈ "
+                    f"{5 * avg_paid:.1f} h and 6 shifts ≈ {6 * avg_paid:.1f} h. "
+                    "Raise *Min shift (h)* so the plan uses longer shifts, or use "
+                    "fewer days off.")
+            hrs_o = [q.paid_hours for q in r.people]
+            fig = go.Figure(go.Histogram(x=hrs_o, xbins=dict(size=1),
+                                         marker_color="#1f77b4"))
+            lo, hi = rp.min_hours, rp.max_hours
+            fig.add_vrect(x0=lo, x1=hi, fillcolor="green", opacity=0.08, line_width=0)
+            fig.add_vline(x=rp.target_hours, line_dash="dash", line_color="green")
+            fig.update_layout(height=220, margin=dict(l=10, r=10, t=30, b=10),
+                              title="Paid hours per person", xaxis_title="paid h / week",
+                              yaxis_title="people", bargap=0.05)
+            st.plotly_chart(fig, width="stretch")
+            st.dataframe(_roster_table(r), hide_index=True, width="stretch",
+                         height=min(600, 38 + 35 * len(r.people)))
 
 
 # ── Results ──────────────────────────────────────────────────────────────────
@@ -617,8 +742,6 @@ if result is not None:
             "The model has no feasible solution with the current settings. "
             "Try relaxing one or more constraints:\n"
             "- Widen the shift-duration range (lower min / raise max)\n"
-            "- Reduce minimum weekly hours or raise maximum weekly hours\n"
-            "- Lower minimum rest hours between shifts\n"
             "- Remove or loosen entry / exit / headcount limits\n"
             "- Uncheck *Exclude night shifts* if demand peaks at night\n"
             "- Increase the solver time limit (the solver may need more time)"
@@ -634,14 +757,36 @@ if result is not None:
     total_wh = cp1.total_worker_intervals / INTERVALS_PER_HOUR
     n_active = sum(1 for c in cp1.counts if c > 0)
 
+    _paid_h = sum(t.paid * t.count for o in result.occupations
+                  for t in slots_from_phase1(o.phase1)) / 60
+    _tgt = roster_params.target_hours
+
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Status", cp1.status)
     c2.metric("Active shifts", n_active)
-    c3.metric("Total worker-h", f"{total_wh:,.0f}")
-    c4.metric("Headcount", total_headcount)
+    c3.metric("Total worker-h", f"{total_wh:,.0f}",
+              help=f"On-shift hours incl. breaks. Paid (after breaks): {_paid_h:,.0f} h")
+    c4.metric("Peak daily starts", total_headcount,
+              help="Most shifts starting on one day — a floor for headcount, not the "
+                   "number of people. See the roster below for people.")
     c5.metric("Peak Simultaneous", peak_sim)
-    c6.metric("FTE (÷45)", f"{total_wh / 45:.1f}")
+    c6.metric(f"FTE (paid ÷ {_tgt:g})", f"{_paid_h / _tgt:.1f}",
+              help="Paid hours (shift length minus unpaid breaks) ÷ target weekly hours.")
     c7.metric("Solve time", f"{cp1.elapsed_sec:.1f}s")
+
+    _rb1, _rb2 = st.columns([1, 3])
+    if _rb1.button("🔁 Rebuild roster", help="Re-run only the roster step with the "
+                   "current roster settings (keeps this shift plan)."):
+        _new = {}
+        _rlog = _rb2.empty()
+        with st.spinner("Building roster …"):
+            for occ in result.occupations:
+                _sl = slots_from_phase1(occ.phase1)
+                _new[occ.name] = (solve_roster(_sl, roster_params, occ.name,
+                                               callback=lambda m: _rlog.caption(m)), _sl)
+        st.session_state["rosters"] = _new
+        _rlog.empty()
+    _render_roster(st.session_state.get("rosters") or {}, result)
 
     # ── Coverage quality ─────────────────────────────────────────────────
     _combined_dem = result.combined_demand
@@ -729,7 +874,7 @@ if result is not None:
                         delta=n_active - _prev_active)
             _dc2.metric("Worker-hours", f"{total_wh:,.0f}",
                         delta=f"{total_wh - _prev_wh:+,.0f}")
-            _dc3.metric("Headcount", total_headcount,
+            _dc3.metric("Peak daily starts", total_headcount,
                         delta=total_headcount - _prev_hc,
                         delta_color="inverse")
             _dc4.metric("Coverage", f"{_pct_covered:.1f} %",
@@ -769,7 +914,7 @@ if result is not None:
             with occ_cols[i]:
                 occ_wh = occ.phase1.total_worker_intervals / INTERVALS_PER_HOUR
                 occ_hc = max_headcount(occ.phase1)
-                st.metric(f"{occ.name} headcount", occ_hc)
+                st.metric(f"{occ.name} peak daily starts", occ_hc)
                 st.metric(f"{occ.name} worker-h", f"{occ_wh:,.0f}")
 
     # combined daily headcount vs minimum table (entry-based)
@@ -1048,6 +1193,20 @@ if result is not None:
     # ── XLSX download ────────────────────────────────────────────────────
     st.subheader("📥 Download report")
     xlsx_bytes = build_weekly_report_xlsx(result)
+    _rost = st.session_state.get("rosters") or {}
+    if _rost:
+        import openpyxl as _oxl
+        _wb = _oxl.load_workbook(io.BytesIO(xlsx_bytes))
+        for _name, (_r, _sl) in _rost.items():
+            if not _r.people:
+                continue
+            _ws = _wb.create_sheet(f"Roster {_name}"[:31])
+            _df = _roster_table(_r)
+            _ws.append(list(_df.columns))
+            for _row in _df.itertuples(index=False):
+                _ws.append(list(_row))
+            _ws.freeze_panes = "C2"
+        _buf = io.BytesIO(); _wb.save(_buf); xlsx_bytes = _buf.getvalue()
     st.download_button(
         "⬇ Download XLSX report",
         data=xlsx_bytes,

@@ -294,10 +294,14 @@ def night_overlap_hours(start: int, end: int) -> float:
 
 
 def break_hours(duration_hours: float) -> float:
-    """Mandatory break: 30 min for 4-7.5 h shifts, 1 h for ≥8 h shifts."""
-    if duration_hours >= 8.0:
+    """Unpaid break, matching GroundStar's paid hours.
+
+    ≤ 4 h: none · over 4 h up to 7.5 h: 30 min · over 7.5 h: 1 h
+    (e.g. 4 h → 4.0 paid, 7.5 h → 7.0, 8.5 h → 7.5, 11 h → 10.0).
+    """
+    if duration_hours > 7.5:
         return 1.0
-    if duration_hours >= 4.0:
+    if duration_hours > 4.0:
         return 0.5
     return 0.0
 
