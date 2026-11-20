@@ -19,6 +19,7 @@ from solver import (
     coverage_dataframe, shifts_to_dataframe,
     shift_type_summary, build_weekly_report_xlsx,
     daily_entry_headcount, max_headcount,
+    buffer_violations,
 )
 from sample_data import generate_sample_demand
 
@@ -284,6 +285,22 @@ with st.sidebar:
                 occ_sc_hc.append(None)
     use_occ_sc_hc = any(v is not None for v in occ_sc_hc)
 
+    with st.expander("⏱ Operational buffers", expanded=True):
+        st.caption("Real-world lead/lag around the workload curve. "
+                   "Set to 0 to get the raw mathematical minimum.")
+        prep_lead = st.number_input(
+            "Prep before operation start (min)", 0, 120, 30, 5,
+            help="Workers must be on shift this long before workload rises. "
+                 "Operation at 08:30 → shift starts 08:00.")
+        exit_lag = st.number_input(
+            "Stay after operation end (min)", 0, 120, 30, 5,
+            help="Workers stay this long after workload drops. "
+                 "Operation ends 17:00 → shift ends 17:30.")
+        handover = st.number_input(
+            "Handover overlap (min)", 0, 120, 30, 5,
+            help="When a worker leaves while the operation continues, "
+                 "the replacement arrives this much earlier so both overlap.")
+
     with st.expander("🔧 Solver", expanded=False):
         time_limit = st.number_input("Time limit (s)", 10, 600, 120, 10)
         t_penalty = st.number_input("Transition penalty", 0, 500, 50, 10)
@@ -311,6 +328,9 @@ params = SolverParams(
     force_include_shifts=force_incl if force_incl else None,
     force_exclude_shifts=force_excl if force_excl else None,
     allowed_slot_minutes=allowed_slot_minutes,
+    prep_lead_min=int(prep_lead),
+    exit_lag_min=int(exit_lag),
+    handover_overlap_min=int(handover),
 )
 
 
@@ -634,6 +654,21 @@ if result is not None:
     cq3.metric("Max deficit", _max_deficit)
     cq4.metric("Over-coverage", f"{_surplus_wh:,.1f} wh")
 
+    # ── Operational buffer check (prep / exit / handover) ───────────────
+    _rp = result.params
+    if result.combined_required is not None:
+        _bv = buffer_violations(result)
+        if _bv["intervals"] == 0:
+            st.success(
+                f"✅ Operational buffers respected — prep {_rp.prep_lead_min} min "
+                f"before ramp-ups, stay {_rp.exit_lag_min} min after ramp-downs, "
+                f"{_rp.handover_overlap_min} min handover overlap.")
+        else:
+            st.warning(
+                f"Operational buffers not fully met: {_bv['intervals']} intervals "
+                f"({_bv['short_wh']:.1f} worker-hours short of prep/exit/handover "
+                f"requirement).")
+
     if _deficit_intervals > 0:
         st.warning(
             f"Demand is not fully covered: **{_deficit_intervals}** intervals "
@@ -861,6 +896,12 @@ if result is not None:
         line=dict(color="red", width=2),
         fill="tozeroy", fillcolor="rgba(255,0,0,0.08)",
     ))
+    if result.combined_required is not None:
+        fig_w.add_trace(go.Scatter(
+            x=x_vals, y=result.combined_required, mode="lines",
+            name="Required incl. prep/exit",
+            line=dict(color="orange", width=1.5, dash="dot"),
+        ))
     fig_w.add_trace(go.Scatter(
         x=x_vals, y=cp1.coverage, mode="lines",
         name="Total coverage",
@@ -939,6 +980,12 @@ if result is not None:
         line=dict(color="red", width=2),
         fill="tozeroy", fillcolor="rgba(255,0,0,0.08)",
     ))
+    if result.combined_required is not None:
+        fig_day.add_trace(go.Scatter(
+            x=day_x, y=result.combined_required[day_start:day_end],
+            mode="lines", name="Required incl. prep/exit",
+            line=dict(color="orange", width=1.5, dash="dot"),
+        ))
     fig_day.add_trace(go.Scatter(
         x=day_x, y=tc, mode="lines", name="Total coverage",
         line=dict(color="green", width=2),
