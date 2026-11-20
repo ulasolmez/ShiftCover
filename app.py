@@ -22,17 +22,11 @@ from solver import (
     buffer_violations,
 )
 from sample_data import generate_sample_demand
+from groundstar_import import read_workload_file, curve_week, combine_by_occupation
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Simplex", layout="wide")
 st.title("🕐 Simplex – Weekly Shift Optimiser")
-
-# ── Handle auto-fill from demand peaks (must run BEFORE sidebar widgets) ─────
-if st.session_state.get("_occ_hc_fill_data"):
-    fill_data = st.session_state["_occ_hc_fill_data"]
-    for key, val in fill_data.items():
-        st.session_state[key] = val
-    del st.session_state["_occ_hc_fill_data"]
 
 st.markdown("""
 <style>
@@ -48,22 +42,37 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+MAX_CURVES = 10
+
+# ── Apply occupations from an import (before the sidebar widgets exist) ─────
+if st.session_state.get("_pending_occ"):
+    _names = st.session_state.pop("_pending_occ")
+    st.session_state["n_curves"] = len(_names)
+    for _i, _n in enumerate(_names):
+        st.session_state[f"occ_name_{_i}"] = _n
+
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Parameters")
 
-    n_curves = st.number_input("Number of occupation curves", 1, 5, 1)
+    st.session_state.setdefault("n_curves", 1)
+    n_curves = st.number_input("Number of occupation curves", 1, MAX_CURVES,
+                               key="n_curves",
+                               help="Set automatically when you load a workload import.")
     occ_names = []
+    _default_names = (["Technician", "Labourer", "Helper", "Supervisor", "Assistant"]
+                      + [f"Occupation {k}" for k in range(6, MAX_CURVES + 1)])
     for i in range(n_curves):
-        default_name = ["Technician", "Labourer", "Helper", "Supervisor", "Assistant"][i]
-        name = st.text_input(f"Occupation {i+1} name",
-                             value=default_name, key=f"occ_name_{i}")
+        st.session_state.setdefault(f"occ_name_{i}", _default_names[i])
+        name = st.text_input(f"Occupation {i+1} name", key=f"occ_name_{i}")
         occ_names.append(name)
 
     with st.expander("⚙ Shift settings", expanded=True):
         min_shift = st.slider("Min shift (h)", 3.0, 8.0, 3.0, 0.5)
         max_shift = st.slider("Max shift (h)", 6.0, 12.0, 12.0, 0.5)
-        max_unique = st.number_input("Max unique shifts (0 = unlimited)", 0, 200, 0)
+        max_unique = st.number_input("Max unique shift types (0 = unlimited)", 0, 200, 0,
+                                     help="Distinct shift codes (e.g. 0800-1600) across the week; "
+                                          "a code used on several days counts once.")
         no_night = st.checkbox("Exclude night shifts (>8.5 h with ≥50 % in 20:00–06:00)", value=False)
         circular = st.checkbox("Circular week (Sunday → Monday)", value=False)
 
@@ -334,108 +343,129 @@ params = SolverParams(
 )
 
 
-# ── Helper: parse uploaded demand file ───────────────────────────────────────
-def _parse_demand_file(uploaded, required_len=TOTAL_INTERVALS):
-    """Return np.ndarray of shape (required_len,) from an uploaded CSV/XLSX."""
-    name = uploaded.name.lower()
-    if name.endswith(".csv"):
-        df = pd.read_csv(uploaded)
-    else:
-        df = pd.read_excel(uploaded)
-
-    # Find the numeric demand column
-    for col in ("Required", "required", "Demand", "demand"):
-        if col in df.columns:
-            arr = df[col].values
-            break
-    else:
-        # pick first numeric column
-        num_cols = df.select_dtypes(include="number").columns
-        if len(num_cols) == 0:
-            raise ValueError("No numeric column found")
-        arr = df[num_cols[0]].values
-
-    if len(arr) < required_len:
-        raise ValueError(f"Need {required_len} rows, got {len(arr)}")
-    return np.round(arr[:required_len]).astype(int)
-
-
 # ── Demand input ─────────────────────────────────────────────────────────────
 st.header("📂 Demand input")
 
 tab_upload, tab_sample = st.tabs(["⬆ Upload files", "🎲 Generate sample"])
 
 with tab_upload:
-    st.info(f"Upload **{n_curves} file(s)** — one per occupation. "
-            "Each must have {TOTAL_INTERVALS} rows with a numeric column "
-            "(e.g. 'Required').")
-    with st.expander("❓ How to format your CSV"):
-        st.markdown("""
-**The optimiser needs one file per occupation** — a single numeric column
-with **2 016 rows** (7 days × 288 five-minute intervals).
+    st.info("Drop your **GroundStar workload exports** (.xlsx with a *Curve Data* "
+            "sheet) — one or several departments at once. Plain CSV/XLSX curves "
+            f"with {TOTAL_INTERVALS} rows still work too.")
+    with st.expander("❓ Supported files"):
+        st.markdown(f"""
+**GroundStar workload export (recommended)** — export the workload curve from
+GroundStar Planning to Excel and upload the file as is. The *Curve Data* sheet is
+read directly: metadata, the time step and every curve column (one per resource
+type / qualification, depending on *Curve Building Criteria*).
 
-| Property | Value |
-|---|---|
-| File type | `.csv` (comma-delimited) or `.xlsx` |
-| Rows | Exactly **2 016** |
-| Column name | `Required` or `Demand` (or first numeric column) |
-| Row order | Monday 00:00 → Sunday 23:55 |
-| Interval | 5 minutes |
+* Each curve becomes a row in the table below. Set its **Occupation** — this is
+  the classification the optimiser plans for (e.g. `DCL`, `CLN`, `INF`).
+* Rows with the **same occupation** are summed (e.g. two files for one department).
+* Untick **Use** to leave a curve out.
+* If the export spans more than one Monday–Sunday week, pick the week per file.
+* 15/30/60-min exports are converted to 5-min steps; fractional workload is
+  rounded **up**.
 
-**Step-by-step**
-1. Ensure every 5-min slot exists (288 per day × 7 days = 2 016 rows).
-   If your data uses 15- or 30-min steps, repeat each value to fill the 5-min slots.
-2. Sort chronologically: Monday 00:00 at the top, Sunday 23:55 at the bottom.
-3. Include a numeric column named `Required` or `Demand`. Extra columns (Day, Time, …) are ignored.
-4. Save as `.csv` with comma delimiters.
-
-**Example (first rows):**
-```
-Day,Time,Required
-Monday,00:00,2
-Monday,00:05,2
-Monday,00:10,3
-```
-
-**Or minimal single-column:**
-```
-Required
-2
-2
-3
-```
-
-**Tips:** Zeros are fine for off-hours. Decimals are rounded automatically.
-Use the *Generate sample* tab to see the exact format.
-
-| Common error | Fix |
-|---|---|
-| *Need 2016 rows, got N* | Ensure all 7 × 288 slots are present |
-| *No numeric column found* | Add a numeric `Required` column |
-| *Missing file for …* | Upload a file for each occupation |
+**Plain curve** — `.csv`/`.xlsx`, one numeric column (`Required`, `Demand`,
+`Workers`, …) with exactly **{TOTAL_INTERVALS}** rows, Monday 00:00 → Sunday 23:55
+in 5-min steps.
 """)
-    uploaded_files = []
-    for i in range(n_curves):
-        f = st.file_uploader(
-            f"{occ_names[i]} demand (CSV / XLSX)",
-            type=["csv", "xlsx"],
-            key=f"upload_{i}",
-        )
-        uploaded_files.append(f)
 
-    if st.button("Load uploaded files", key="btn_load"):
+    up_files = st.file_uploader(
+        "Workload files", type=["xlsx", "xlsm", "csv"],
+        accept_multiple_files=True, key="wl_files")
+
+    @st.cache_data(show_spinner=False)
+    def _read_cached(name: str, data: bytes):
+        return read_workload_file(_NamedBytes(data, name))
+
+    class _NamedBytes(io.BytesIO):
+        def __init__(self, data, name):
+            super().__init__(data)
+            self.name = name
+
+    parsed = []
+    for f in up_files or []:
         try:
-            demands = []
-            for i, f in enumerate(uploaded_files):
-                if f is None:
-                    st.error(f"Missing file for {occ_names[i]}")
-                    st.stop()
-                demands.append(_parse_demand_file(f))
-            st.session_state["demands"] = demands
-            st.session_state["occ_names"] = occ_names[:]
-            st.success(f"Loaded {len(demands)} curve(s)")
+            parsed.append(_read_cached(f.name, f.getvalue()))
         except Exception as exc:
-            st.error(str(exc))
+            st.error(f"{f.name}: {exc}")
+
+    if parsed:
+        rows, curve_refs = [], []
+        for fi, wf in enumerate(parsed):
+            for w in wf.warnings:
+                st.warning(w)
+            week = None
+            if wf.kind == "groundstar":
+                starts = wf.week_starts()
+                meta_bits = [f"**{wf.file_name}**"]
+                if wf.resource_type:
+                    meta_bits.append(f"resource type `{wf.resource_type}`")
+                if wf.meta.get("Curve Building Criteria"):
+                    meta_bits.append(f"curves by *{wf.meta['Curve Building Criteria']}*")
+                if starts:
+                    labels = [f"{d:%a %d %b %Y} → {(d + pd.Timedelta(days=6)):%a %d %b}"
+                              for d in starts]
+                    if len(starts) > 1:
+                        pick = st.selectbox(f"Week for {wf.file_name}", labels,
+                                            key=f"wl_week_{fi}_{wf.file_name}")
+                        week = starts[labels.index(pick)]
+                    else:
+                        week = starts[0]
+                        meta_bits.append(f"week {labels[0]}")
+                else:
+                    meta_bits.append("no full Mon–Sun week — weekdays mapped from "
+                                     "their first occurrence")
+                st.caption(" · ".join(meta_bits))
+            default = {id(c) for c in wf.default_curves()}
+            for c in wf.curves:
+                d = curve_week(c, week)
+                occ = c.name if c.role in ("Standard", "Plain") else (
+                    wf.resource_type or c.name)
+                rows.append({
+                    "Use": id(c) in default,
+                    "Occupation": occ,
+                    "File": wf.file_name,
+                    "Curve": c.name,
+                    "Type": c.role,
+                    "Peak": int(d.max()),
+                    "Workload h": round(d.sum() / 12, 1),
+                })
+                curve_refs.append(d)
+
+        _sig = "|".join(f"{wf.file_name}:{len(wf.curves)}" for wf in parsed)
+        edited = st.data_editor(
+            pd.DataFrame(rows), key=f"wl_table_{hash(_sig)}",
+            hide_index=True, width="stretch",
+            disabled=["File", "Curve", "Type", "Peak", "Workload h"],
+            column_config={
+                "Use": st.column_config.CheckboxColumn(width="small"),
+                "Occupation": st.column_config.TextColumn(
+                    help="Classification to plan for. Same name = curves summed."),
+            })
+
+        sel = [{"occupation": r["Occupation"], "demand": curve_refs[i]}
+               for i, r in edited.iterrows() if r["Use"] and str(r["Occupation"]).strip()]
+        combined = combine_by_occupation(sel)
+        if combined:
+            st.caption("Will load: " + ", ".join(
+                f"**{n}** (peak {int(d.max())}, {d.sum() / 12:,.0f} h)"
+                for n, d in combined.items()))
+        if st.button("Load workload", key="btn_load", type="primary",
+                     disabled=not combined):
+            if len(combined) > MAX_CURVES:
+                st.error(f"{len(combined)} occupations selected — max is {MAX_CURVES}.")
+            else:
+                st.session_state["demands"] = list(combined.values())
+                st.session_state["occ_names"] = list(combined.keys())
+                st.session_state["_pending_occ"] = list(combined.keys())
+                st.session_state["demand_source"] = "import"
+                st.rerun()
+    if (st.session_state.get("demand_source") == "import"
+            and st.session_state.get("demands") is not None):
+        st.success("Loaded: " + ", ".join(st.session_state["occ_names"]))
 
 with tab_sample:
     cols_sample = st.columns(n_curves)
@@ -463,6 +493,7 @@ with tab_sample:
             demands.append(d)
         st.session_state["demands"] = demands
         st.session_state["occ_names"] = occ_names[:]
+        st.session_state["demand_source"] = "sample"
         st.success(f"Generated {n_curves} sample curve(s)")
 
 # ── Preview demand chart ─────────────────────────────────────────────────────
@@ -510,7 +541,6 @@ if demands is not None:
     # ── Daily peak demand reference ──────────────────────────────────────
     with st.expander("📊 Daily peak demand by occupation", expanded=True):
         peak_rows = []
-        peak_lookup: dict = {}  # (occ_i, day) -> peak value
         for i, (d, name) in enumerate(zip(demands, stored_names)):
             for day in range(7):
                 s = day * INTERVALS_PER_DAY
@@ -521,30 +551,9 @@ if demands is not None:
                     "Day": DAY_NAMES[day],
                     "Peak Demand": peak_val,
                 })
-                peak_lookup[(i, day)] = peak_val
         if peak_rows:
             st.dataframe(pd.DataFrame(peak_rows),
                          width="stretch", hide_index=True)
-
-            _buf_col, _btn_col = st.columns([2, 3])
-            with _buf_col:
-                peak_buffer = st.slider(
-                    "Buffer (add to peak)", 0, 20, 2, 1,
-                    key="peak_buffer",
-                    help="Extra headroom added to each peak demand before setting the limit."
-                )
-            with _btn_col:
-                st.caption("")  # vertical alignment spacer
-                if st.button("📋 Copy peaks to limits", key="copy_peaks_btn",
-                             help="Auto-fill the per-occupation headcount limit boxes "
-                                  "in the sidebar with (peak + buffer) for each day."):
-                    fill_data = {}
-                    for (i, day), peak in peak_lookup.items():
-                        fill_data[f"occ_hc_{i}_{day}"] = peak + peak_buffer
-                    st.session_state["_occ_hc_fill_data"] = fill_data
-                    st.rerun()
-            st.caption("Use these peaks to set **Max headcount per occupation per day** "
-                       "limits in the sidebar. Set each occupation's daily cap ≥ its peak demand.")
 
     # Demand summary
     total_demand_h = sum(d.sum() for d in demands) / INTERVALS_PER_HOUR
@@ -764,12 +773,12 @@ if result is not None:
                 st.metric(f"{occ.name} worker-h", f"{occ_wh:,.0f}")
 
     # combined daily headcount vs minimum table (entry-based)
-    if params.min_headcount_per_day:
+    if _rp.min_headcount_per_day:
         with st.expander("👥 Combined daily headcount vs minimum", expanded=False):
             rows = []
             daily_entries = daily_entry_headcount(cp1)
             for day in range(7):
-                min_req = params.min_headcount_per_day[day]
+                min_req = _rp.min_headcount_per_day[day]
                 if min_req <= 0:
                     continue
                 actual = daily_entries[day]
@@ -786,11 +795,11 @@ if result is not None:
                 st.caption("No combined minimum headcount requirements were set.")
 
     # per-occupation daily headcount vs limit table (entry-based)
-    if params.occ_max_headcount_per_day:
+    if _rp.occ_max_headcount_per_day:
         with st.expander("👤 Per-occupation daily headcount vs limit", expanded=False):
             rows = []
             for i, occ in enumerate(result.occupations):
-                occ_limits = params.occ_max_headcount_per_day[i]
+                occ_limits = _rp.occ_max_headcount_per_day[i]
                 if occ_limits is None:
                     continue
                 daily = daily_entry_headcount(occ.phase1)
@@ -813,11 +822,11 @@ if result is not None:
                 st.caption("No per-occupation headcount limits were set.")
 
     # per-occupation shift-code headcount table
-    if params.occ_headcount_per_shift_code:
+    if _rp.occ_headcount_per_shift_code:
         with st.expander("🕐 Shift-type headcount vs limits", expanded=False):
             rows = []
             for i, occ in enumerate(result.occupations):
-                sc_limits = params.occ_headcount_per_shift_code[i]
+                sc_limits = _rp.occ_headcount_per_shift_code[i]
                 if sc_limits is None:
                     continue
                 for code, spec in sc_limits.items():
@@ -858,11 +867,11 @@ if result is not None:
                 st.caption("No shift-type headcount constraints were active.")
 
     # per-occupation daily headcount vs minimum table (entry-based)
-    if params.occ_min_headcount_per_day:
+    if _rp.occ_min_headcount_per_day:
         with st.expander("👤 Per-occupation daily headcount vs minimum", expanded=False):
             rows = []
             for i, occ in enumerate(result.occupations):
-                occ_mins = params.occ_min_headcount_per_day[i]
+                occ_mins = _rp.occ_min_headcount_per_day[i]
                 if occ_mins is None:
                     continue
                 daily = daily_entry_headcount(occ.phase1)
