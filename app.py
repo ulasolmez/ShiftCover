@@ -143,6 +143,12 @@ with st.sidebar:
         build_roster = st.checkbox("Build roster after planning shifts", value=True,
                                    help="Assigns every planned shift to a person to "
                                         "get the real headcount.")
+        plan_hc = st.checkbox(
+            "Plan for full-time headcount", value=True,
+            help="The shift plan minimises PEOPLE (not worker-hours) and gives the "
+                 "plan target hours × people, so everyone can work ~target hours. "
+                 "Off: the classic plan with minimum worker-hours — cheaper on hours, "
+                 "but with full-time staff many people end up well below 40 h.")
         _off_labels = {
             "1": "1 off — ≤ 6 shifts, one rest ≥ 24 h",
             "1.5": "1.5 off — half 1-off / half 2-off (alternating weeks)",
@@ -375,6 +381,12 @@ params = SolverParams(
     prep_lead_min=int(prep_lead),
     exit_lag_min=int(exit_lag),
     handover_overlap_min=int(handover),
+    plan_for_headcount=bool(plan_hc),
+    hc_shifts_per_person={"1": 6.0, "1.5": 5.5, "2": 5.0, "auto": 6.0}[off_mode],
+    hc_target_hours=float(target_wh),
+    hc_min_hours=float(min_wh),
+    hc_max_hours=float(max_wh),
+    hc_min_rest_hours=float(min_rest),
 )
 
 
@@ -786,6 +798,14 @@ if result is not None:
                                                callback=lambda m: _rlog.caption(m)), _sl)
         st.session_state["rosters"] = _new
         _rlog.empty()
+    if result.params.plan_for_headcount:
+        _pp = [o.phase1.planned_people for o in result.occupations]
+        if all(v is not None for v in _pp):
+            st.info(
+                f"Plan sized for **{sum(_pp)} full-time people** "
+                f"({', '.join(f'{o.name} {v}' for o, v in zip(result.occupations, _pp))}) "
+                f"at ~{result.params.hc_target_hours:g} paid h each, "
+                f"≤ {result.params.hc_shifts_per_person:g} shifts per person.")
     _render_roster(st.session_state.get("rosters") or {}, result)
 
     # ── Coverage quality ─────────────────────────────────────────────────
@@ -806,7 +826,10 @@ if result is not None:
     cq1.metric("Coverage", f"{_pct_covered:.1f} %")
     cq2.metric("Under-coverage", f"{_gap_wh:,.1f} wh")
     cq3.metric("Max deficit", _max_deficit)
-    cq4.metric("Over-coverage", f"{_surplus_wh:,.1f} wh")
+    cq4.metric("Over-coverage", f"{_surplus_wh:,.1f} wh",
+               help="Worker-hours on shift beyond the workload. In full-time headcount "
+                    "mode this is intentional: the people needed for the peaks are "
+                    "given target hours, and the extra time lands here.")
 
     # ── Operational buffer check (prep / exit / handover) ───────────────
     _rp = result.params

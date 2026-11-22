@@ -145,6 +145,18 @@ class SolverParams:
     prep_lead_min: int = 0
     exit_lag_min: int = 0
     handover_overlap_min: int = 0
+    # ── Plan for full-time headcount (0/False = classic min worker-hours) ──
+    # When on, the plan minimises PEOPLE (per occupation) and puts total paid
+    # hours as close as possible to target × people, so the roster can give
+    # everyone ~target hours.  Aggregate roster rules are built in:
+    #   shift starts per day ≤ people · total shifts ≤ shifts_per_person ×
+    #   people · min × people ≤ paid hours ≤ max × people · night rest cuts.
+    plan_for_headcount: bool = False
+    hc_shifts_per_person: float = 5.0      # 5 (2 off), 5.5 (1.5 off), 6 (1 off)
+    hc_target_hours: float = 45.0          # paid hours per person per week
+    hc_min_hours: float = 40.0
+    hc_max_hours: float = 50.0
+    hc_min_rest_hours: float = 12.0
 
 
 # ── Operational buffer helpers ───────────────────────────────────────────────
@@ -216,6 +228,7 @@ class PhaseOneResult:
     coverage: np.ndarray
     status: str
     elapsed_sec: float
+    planned_people: Optional[int] = None   # headcount-mode plan only
 
 
 def daily_entry_headcount(p1: PhaseOneResult) -> List[int]:
@@ -680,24 +693,154 @@ def _build_multi_curve_model(
     if callback:
         callback(f"Coverage constraints added for {n_occ} occupation(s)")
 
+    # ── Plan for full-time headcount ──────────────────────────────────────
+    people = {}
+    if params.plan_for_headcount:
+        people, hc_terms = _add_headcount_model(model, x, shifts, n_occ, demands,
+                                                params, day_shift_idxs, callback)
+
     # ── Objective ─────────────────────────────────────────────────────────
     obj_terms = []
-    for occ in range(n_occ):
-        for s in shifts:
-            obj_terms.append(x[occ][s.idx] * s.duration_intervals)
-
     tp = params.transition_penalty
-    if tp > 0:
-        for s in shifts:
-            obj_terms.append(z[s.idx] * tp * 2)
-        if callback:
-            callback(f"Transition penalty {tp} on shared shift activation")
+    if params.plan_for_headcount:
+        obj_terms.extend(hc_terms)
+        if tp > 0:
+            for s in shifts:
+                obj_terms.append(z[s.idx] * tp)
+    else:
+        for occ in range(n_occ):
+            for s in shifts:
+                obj_terms.append(x[occ][s.idx] * s.duration_intervals)
+        if tp > 0:
+            for s in shifts:
+                obj_terms.append(z[s.idx] * tp * 2)
+            if callback:
+                callback(f"Transition penalty {tp} on shared shift activation")
 
     model.minimize(sum(obj_terms))
     if callback:
         callback("Model built – starting Phase 1 solve …")
 
+    model._people = people          # read back by the extractor
     return model, x, z
+
+
+def paid_intervals(s: "CandidateShift") -> int:
+    """Paid 5-min intervals of a shift (length minus unpaid break)."""
+    return int(round(effective_hours(s.duration_intervals / INTERVALS_PER_HOUR)
+                     * INTERVALS_PER_HOUR))
+
+
+def _add_headcount_model(model, x, shifts, n_occ, demands, params,
+                         day_shift_idxs, callback):
+    """People variables + the roster's aggregate rules, per occupation.
+
+    Returns ({occ: N_var}, objective terms).
+
+    Rules (necessary for any roster with these people):
+      * shift starts on each day ≤ N           (one shift per person per day)
+      * total shifts ≤ shifts_per_person × N
+      * min_h × N ≤ paid hours ≤ max_h × N
+      * night rest: for consecutive days d → d+1 and every end time e on d,
+            #shifts on d ending ≥ e  +  #shifts on d+1 starting ≤ e + rest − 1
+        ≤ N, because those two groups can't share a person (rest < 12 h).
+    Objective: people first, then |paid − target × N|, then fewer shift
+    starts (longer shifts → easier to reach the target with 5–6 shifts).
+    """
+    R = int(round(params.hc_min_rest_hours * INTERVALS_PER_HOUR))
+    spp2 = int(round(params.hc_shifts_per_person * 2))        # 5.5 → 11 (halves)
+    tgt = int(round(params.hc_target_hours * INTERVALS_PER_HOUR))
+    lo = int(round(params.hc_min_hours * INTERVALS_PER_HOUR))
+    hi = int(round(params.hc_max_hours * INTERVALS_PER_HOUR))
+    paid = {s.idx: paid_intervals(s) for s in shifts}
+    W = TOTAL_INTERVALS            # one interval of 5-min = 1, a week = 2016
+
+    people, terms, primary, secondary = {}, [], [], []
+    by_day = {d: [shifts[i] for i in day_shift_idxs[d]] for d in range(7)}
+    n_cuts = 0
+    for occ in range(n_occ):
+        need = demands[occ]
+        if need.max() <= 0:
+            N = model.new_int_var(0, 0, f"N_{occ}")
+            people[occ] = N
+            continue
+        ub = int(sum(int(v) for v in need)) // max(1, int(params.min_shift_hours *
+                                                         INTERVALS_PER_HOUR)) + 7
+        N = model.new_int_var(0, max(ub, int(need.max()) * 7), f"N_{occ}")
+        people[occ] = N
+        xo = x[occ]
+        for d in range(7):
+            if by_day[d]:
+                model.add(sum(xo[s.idx] for s in by_day[d]) <= N)
+        n_sh = sum(xo[s.idx] for s in shifts)
+        model.add(2 * n_sh <= spp2 * N)
+        # unused shift slots (spp × N − shifts) leave someone with a short
+        # week; penalise them like that person's missing hours
+        slot_gap = model.new_int_var(0, spp2 * (ub + 1) * 7, f"slotgap_{occ}")
+        model.add(slot_gap == spp2 * N - 2 * n_sh)
+        P = sum(xo[s.idx] * paid[s.idx] for s in shifts)
+        model.add(P >= lo * N)
+        model.add(P <= hi * N)
+        dev = model.new_int_var(0, hi * 2 * (ub + 1), f"hdev_{occ}")
+        model.add(dev >= P - tgt * N)
+        model.add(dev >= tgt * N - P)
+
+        # night-rest cuts with running totals (sparse)
+        for d in range(7):
+            if d == 6 and not params.circular_week:
+                continue
+            n = (d + 1) % 7
+            wrap = TOTAL_INTERVALS if d == 6 else 0
+            A, B = by_day[d], by_day[n]
+            if not A or not B:
+                continue
+            ends = sorted({s.global_end for s in A})
+            starts = sorted({s.global_start + wrap for s in B})
+            # suffix sums over end time (≥ e)
+            suf, acc = {}, None
+            for e in reversed(ends):
+                grp = [xo[s.idx] for s in A if s.global_end == e]
+                v = model.new_int_var(0, 10 ** 6, f"sa_{occ}_{d}_{e}")
+                model.add(v == (acc if acc is not None else 0) + sum(grp))
+                suf[e], acc = v, v
+            # prefix sums over start time (≤ v)
+            pre, acc, keys = {}, None, []
+            for st_ in starts:
+                grp = [xo[s.idx] for s in B if s.global_start + wrap == st_]
+                v = model.new_int_var(0, 10 ** 6, f"pb_{occ}_{d}_{st_}")
+                model.add(v == (acc if acc is not None else 0) + sum(grp))
+                pre[st_], acc = v, v
+                keys.append(st_)
+            import bisect
+            for e in ends:
+                lim = e + R - 1
+                k = bisect.bisect_right(keys, lim) - 1
+                if k < 0:
+                    continue
+                model.add(suf[e] + pre[keys[k]] <= N)
+                n_cuts += 1
+
+        primary.append(N)
+        terms += [N * (W * 50), dev * 10,
+                  slot_gap * 5 * int(round(tgt / params.hc_shifts_per_person))]
+        secondary += [dev * 10,
+                      slot_gap * 5 * int(round(tgt / params.hc_shifts_per_person))]
+        # prefer shift lengths that add up to the target in shifts_per_person
+        # shifts (45 h / 5 → 9 h paid) — keeps the roster's hours even
+        ideal = tgt / params.hc_shifts_per_person
+        pref = [xo[s.idx] * int(round(abs(paid[s.idx] - ideal))) for s in shifts
+                if abs(paid[s.idx] - ideal) >= 1]
+        pref += [xo[s.idx] for s in shifts]           # fewer shifts on ties
+        terms += pref
+        secondary += pref
+
+    if callback:
+        callback(f"Headcount plan: ≤ {params.hc_shifts_per_person:g} shifts/person, "
+                 f"{params.hc_min_hours:g}–{params.hc_max_hours:g} h (target "
+                 f"{params.hc_target_hours:g} h), {n_cuts} night-rest cuts")
+    model._hc_primary = primary
+    model._hc_secondary = secondary
+    return people, terms
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -720,7 +863,8 @@ def _solve_cp_sat(
     """
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = params.solver_time_limit_sec
-    solver.parameters.num_workers = 4
+    import os as _os
+    solver.parameters.num_workers = max(4, min(16, _os.cpu_count() or 4))
     solver.parameters.log_search_progress = False
 
     status_code = solver.solve(model)
@@ -743,6 +887,7 @@ def _extract_phase1_results(
     n_occ: int,
     occ_names: List[str],
     callback=None,
+    model_ref=None,
 ) -> Tuple[List[PhaseOneResult], PhaseOneResult]:
     """
     Extract per-occupation and combined PhaseOneResult from a solved model.
@@ -772,6 +917,7 @@ def _extract_phase1_results(
     combined_counts   = [0] * len(shifts)
     combined_coverage = np.zeros(TOTAL_INTERVALS, dtype=int)
 
+    people_vars = getattr(model_ref[0], "_people", {}) if model_ref else {}
     for occ in range(n_occ):
         counts   = [solver.value(x[occ][s.idx]) for s in shifts]
         coverage = np.zeros(TOTAL_INTERVALS, dtype=int)
@@ -782,7 +928,9 @@ def _extract_phase1_results(
         total_wi = sum(c * s.duration_intervals
                        for s, c in zip(shifts, counts))
         per_occ.append(PhaseOneResult(
-            shifts, counts, total_wi, coverage, status_str, elapsed))
+            shifts, counts, total_wi, coverage, status_str, elapsed,
+            planned_people=(int(solver.value(people_vars[occ]))
+                            if occ in people_vars else None)))
         for i, c in enumerate(counts):
             combined_counts[i] += c
         combined_coverage += coverage
@@ -858,16 +1006,73 @@ def solve_phase1_multi(
         day_shift_idxs[s.day].append(s.idx)
 
     # ── Stage 2: build model ─────────────────────────────────────────────
+    hint = None
+    if params.plan_for_headcount:
+        # Warm start: a quick classic plan (min worker-hours) covers demand
+        # and gives the headcount model a feasible starting point.
+        import dataclasses as _dc
+        warm_t = max(5.0, params.solver_time_limit_sec * 0.25)
+        wp = _dc.replace(params, plan_for_headcount=False, solver_time_limit_sec=warm_t)
+        if callback:
+            callback(f"Headcount plan: warm start with a {warm_t:.0f}s classic plan …")
+        wm, wx, wz = _build_multi_curve_model(
+            req_demands, wp, cov, shifts, n_occ, day_shift_idxs, None)
+        ws, wst, _, _ = _solve_cp_sat(wm, wp, time.time())
+        if wst in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            hint = {(o, s.idx): ws.value(wx[o][s.idx]) for o in range(n_occ) for s in shifts}
     model, x, z = _build_multi_curve_model(
         req_demands, params, cov, shifts, n_occ, day_shift_idxs, callback)
+    if hint:
+        for (o, i), v in hint.items():
+            model.add_hint(x[o][i], v)
+        for s in shifts:
+            model.add_hint(z[s.idx], int(any(hint[(o, s.idx)] for o in range(n_occ))))
 
     # ── Stage 3: solve ───────────────────────────────────────────────────
-    solver, status_code, status_str, elapsed = _solve_cp_sat(model, params, t0)
+    if params.plan_for_headcount:
+        import dataclasses as _dc
+        people = model._people
+        secondary = list(model._hc_secondary)
+        if params.transition_penalty > 0:
+            secondary += [z[s.idx] * params.transition_penalty for s in shifts]
+        # 3a — fewest people
+        left = max(5.0, params.solver_time_limit_sec - (time.time() - t0))
+        model.minimize(sum(people.values()))
+        if callback:
+            callback(f"Headcount plan: minimising people ({left * 0.55:.0f}s) …")
+        sa, sta, stra, _ = _solve_cp_sat(
+            model, _dc.replace(params, solver_time_limit_sec=left * 0.55), t0)
+        if sta in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            best_n = {o: int(sa.value(v)) for o, v in people.items()}
+            vals = {(o, s.idx): sa.value(x[o][s.idx]) for o in range(n_occ) for s in shifts}
+            if callback:
+                callback(f"Headcount plan: {sum(best_n.values())} people ({stra}) — "
+                         f"now balancing hours towards {params.hc_target_hours:g} h")
+            # 3b — keep that headcount, balance hours / shift lengths
+            for o, v in people.items():
+                model.add(v == best_n[o])
+            model.clear_hints()
+            for (o, i), v in vals.items():
+                model.add_hint(x[o][i], v)
+            for s in shifts:
+                model.add_hint(z[s.idx], int(any(vals[(o, s.idx)] for o in range(n_occ))))
+            model.minimize(sum(secondary))
+            left = max(5.0, params.solver_time_limit_sec - (time.time() - t0))
+            solver, status_code, status_str, elapsed = _solve_cp_sat(
+                model, _dc.replace(params, solver_time_limit_sec=left), t0)
+            if status_code not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                solver, status_code, status_str = sa, sta, stra
+            elif stra != "OPTIMAL":
+                status_str = "FEASIBLE"          # headcount not proven minimal
+        else:
+            solver, status_code, status_str, elapsed = sa, sta, stra, time.time() - t0
+    else:
+        solver, status_code, status_str, elapsed = _solve_cp_sat(model, params, t0)
 
     # ── Stage 4: extract results ─────────────────────────────────────────
     return _extract_phase1_results(
         solver, status_code, status_str, elapsed,
-        x, shifts, n_occ, occ_names, callback)
+        x, shifts, n_occ, occ_names, callback, model_ref=[model])
 
 
 # ── Convenience entry points ─────────────────────────────────────────────────

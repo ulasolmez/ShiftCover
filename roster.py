@@ -60,7 +60,7 @@ class RosterParams:
     pt_max_shifts: int = 4
     circular_week: bool = True
     time_limit_sec: float = 60.0
-    num_workers: int = 8
+    num_workers: int = 0          # 0 = all cores (4–16)
 
 
 @dataclass
@@ -261,7 +261,8 @@ def _pair_tables(slots, circular):
     return by_day, nxt, skip
 
 
-def _build(slots, rp: RosterParams, P: int, fix_people=None, fix_pt=None):
+def _build(slots, rp: RosterParams, P: int, fix_people=None, fix_pt=None,
+           sort_by_hours=True):
     m = cp_model.CpModel()
     w = _windows(rp)
     rest = int(round(rp.min_rest_hours * 60))
@@ -358,7 +359,8 @@ def _build(slots, rp: RosterParams, P: int, fix_people=None, fix_pt=None):
     # symmetry breaking: people sorted by paid hours (always possible because
     # people are interchangeable) — unused people (H = 0) end up last
     for p in range(P - 1):
-        m.add(H[p] >= H[p + 1])
+        if sort_by_hours:
+            m.add(H[p] >= H[p + 1])
         m.add(used[p] >= used[p + 1])
 
     if rp.off_mode == "1.5":
@@ -596,7 +598,8 @@ def _valid(assign, slots, rp) -> bool:
 def _solve(m, rp, seconds, hint=None):
     s = cp_model.CpSolver()
     s.parameters.max_time_in_seconds = max(1.0, seconds)
-    s.parameters.num_workers = rp.num_workers
+    import os
+    s.parameters.num_workers = rp.num_workers or max(4, min(16, os.cpu_count() or 4))
     if hint:
         for var, val in hint:
             m.add_hint(var, val)
@@ -679,7 +682,7 @@ def solve_roster(slots: List[SlotType], rp: RosterParams, occupation: str = "",
     best = greedy
     status1 = "GREEDY" if greedy else "NONE"
     if not greedy or len(greedy) > lb:
-        m, v = _build(slots, rp, P)
+        m, v = _build(slots, rp, P, sort_by_hours=False)
         m.add(sum(v["used"]) >= lb)
         if greedy:
             m.add(sum(v["used"]) <= len(greedy))
