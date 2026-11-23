@@ -93,6 +93,8 @@ class SolverParams:
     max_shift_hours: float        = 12.0
     shift_start_granularity_min: int = 30
     shift_duration_step_min: int  = 30
+    # Not used by the shift plan (person-level rules; the roster step that
+    # used them was removed). Kept so existing scripts/tests still construct.
     min_weekly_hours: float       = 40.0
     max_weekly_hours: float       = 50.0
     min_rest_hours: float         = 12.0
@@ -716,7 +718,8 @@ def _solve_cp_sat(
     """
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = params.solver_time_limit_sec
-    solver.parameters.num_workers = 4
+    import os as _os
+    solver.parameters.num_workers = max(4, min(16, _os.cpu_count() or 4))
     solver.parameters.log_search_progress = False
 
     status_code = solver.solve(model)
