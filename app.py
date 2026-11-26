@@ -28,7 +28,7 @@ from groundstar_rules import (
     decode_text, is_inform_flights, read_inform_flights, leg_week_starts,
     build_events, events_dataframe, events_to_flights, flights_to_events,
     read_engage_rules, rules_summary, referenced_groups, default_actype_groups,
-    parse_flight_number_groups, engage_tasks,
+    parse_flight_number_groups, default_fn_text, engage_tasks,
 )
 from task_solver import (
     TaskParams, TaskResult, solve_tasks, utilisation, task_hours,
@@ -405,14 +405,17 @@ airline-specific rules override the defaults.
                              for _, r in ac_edit.iterrows()}
         fn_names = referenced_groups(rules_df[rules_df["ResourceType"].isin(sel_deps)],
                                      ["flightNumberGroup"])
-        fn_text = ""
+        fn_text = default_fn_text(fn_names)
         if fn_names:
             with st.expander("🔢 Flight number groups", expanded=False):
                 st.caption("Rules use these flight-number groups: "
                            + ", ".join(f"`{n}`" for n in fn_names)
-                           + ". One line per group, e.g. `THYA = THY2600-2699, THY2805`. "
+                           + ". One line per group: an airline code for all its flights "
+                             "(`THYA = TKJ` – AJet's old THY group, today TKJ) or flight "
+                             "numbers (`THY2600-2699, THY2805`). A rule with a group covers "
+                             "the group's flights whatever its airline column says. "
                              "Undefined groups match no flight.")
-                fn_text = st.text_area("Groups", "\n".join(f"{n} = " for n in fn_names),
+                fn_text = st.text_area("Groups", default_fn_text(fn_names),
                                        key="fn_groups", label_visibility="collapsed")
         if events is None and fl:
             st.caption("With a flight table (not the INFORM export) pax, domestic/"

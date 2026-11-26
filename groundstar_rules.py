@@ -445,22 +445,37 @@ def default_actype_groups(legs: List[Leg], groups: List[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def parse_flight_number_groups(text: str) -> Dict[str, Set[Tuple[str, int]]]:
-    """``THYA = THY2600-2699, THY2805`` (one group per line)."""
-    out: Dict[str, Set[Tuple[str, int]]] = {}
+# Known renamed groups: old flight-number group → today's airline code
+DEFAULT_FN_GROUPS = {"THYA": "TKJ"}      # AJet: was THY 2xxx, now its own code TKJ
+
+
+def parse_flight_number_groups(text: str) -> Dict[str, Set[Tuple[str, Optional[int]]]]:
+    """One group per line: ``THYA = TKJ`` (every TKJ flight) or
+    ``THYA = THY2600-2699, THY2805`` (flight numbers / ranges)."""
+    out: Dict[str, Set[Tuple[str, Optional[int]]]] = {}
     for line in (text or "").splitlines():
         if "=" not in line:
             continue
         name, spec = line.split("=", 1)
-        s: Set[Tuple[str, int]] = set()
-        for part in re.split(r"[,\s]+", spec.strip()):
-            m = re.fullmatch(r"([A-Z0-9]{2,3}?)(\d+)(?:-(\d+))?", part.strip().upper())
+        s: Set[Tuple[str, Optional[int]]] = set()
+        for part in re.split(r"[,\s]+", spec.strip().upper()):
+            if not part:
+                continue
+            if re.fullmatch(r"[A-Z0-9]{2,3}", part) and not part.isdigit():
+                s.add((part, None))                 # whole airline
+                continue
+            m = re.fullmatch(r"([A-Z][A-Z0-9]{1,2}?)(\d+)(?:-(\d+))?", part)
             if not m:
                 continue
             al, a, b = m.group(1), int(m.group(2)), int(m.group(3) or m.group(2))
             s.update((al, k) for k in range(a, b + 1))
         out[name.strip()] = s
     return out
+
+
+def default_fn_text(names: List[str]) -> str:
+    return "\n".join(f"{n} = {DEFAULT_FN_GROUPS.get(n, '')}".rstrip() + ("" if n in DEFAULT_FN_GROUPS else " ")
+                     for n in names)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -543,8 +558,11 @@ def engage_tasks(events: List[Event], rules: pd.DataFrame, departments: List[str
 
     def matches(r, c: _Ctx) -> bool:
         l = c.leg
+        fg = g(r, "flightNumberGroup")
         al = _list(g(r, "airline"))
-        if al and l.airline not in al:
+        # With a flight-number group the group decides which flights are meant
+        # (e.g. THYA = AJet, today airline TKJ), so the airline filter is skipped.
+        if al and not fg and l.airline not in al:
             return False
         if l.airline in _list(g(r, "notAirline")):
             return False
@@ -570,10 +588,10 @@ def engage_tasks(events: List[Event], rules: pd.DataFrame, departments: List[str
         ch = _list(g(r, "chainHandlingType1"))
         if ch and (c.other is None or c.other.ht1 not in ch):
             return False
-        fg = g(r, "flightNumberGroup")
         if fg:
             num = _int(re.sub(r"\D", "", l.number))
-            if (l.airline, num) not in fn_groups.get(fg, set()):
+            grp = fn_groups.get(fg, set())
+            if (l.airline, num) not in grp and (l.airline, None) not in grp:
                 return False
         mine = ac_groups.get(l.actype, set())
         ag = _list(g(r, "acTypeGroup"))

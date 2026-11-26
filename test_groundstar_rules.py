@@ -132,3 +132,26 @@ def test_group_helpers():
     assert row["NB"] and not row["WB"] and not row["01_SEATS_0-20"]
     fg = parse_flight_number_groups("THYA = THY2600-2602, THY2805\nX = ")
     assert ("THY", 2601) in fg["THYA"] and ("THY", 2805) in fg["THYA"] and fg["X"] == set()
+
+
+def test_flight_number_group_as_airline_overrides_airline_filter():
+    from groundstar_rules import default_fn_text
+    fg = parse_flight_number_groups(default_fn_text(["THYA"]))
+    assert fg["THYA"] == {("TKJ", None)}
+    rules_txt = "\r\n".join([
+        HDR.format("TRF"),
+        "ruleActivation\truleDescription\tairline\tflightNumberGroup\trulePhase\t"
+        "ResourceType\tbegin\tend\tcount\tmandQual1\tengagegroups\tpriority",
+        "1\tCheck-in default\t\t\t0\tTRF\t-150\t-40\t2\tTRF\tCheck-in\t10",
+        "1\tCheck-in THYA\tTHY\tTHYA\t0\tTRF\t-120\t-20\t2\tTRF\tCheck-in\t30",
+        "",
+    ])
+    rules, _ = read_engage_rules(rules_txt.encode("utf-16"))
+    line = _legs_text().splitlines()[1].replace("PGT;101", "TKJ;101").replace("PGT;100", "TKJ;100")
+    line0 = _legs_text().splitlines()[0].replace("PGT;100", "TKJ;100").replace("PGT;101", "TKJ;101")
+    legs, _ = read_inform_flights((line0 + "\n" + line).encode())
+    ev = build_events(legs, leg_week_starts(legs)[0])
+    with_grp = engage_tasks(ev, rules, ["TRF"], fn_groups=fg)
+    assert [t.rule for t in with_grp.tasks] == ["Check-in THYA"]
+    without = engage_tasks(ev, rules, ["TRF"], fn_groups={})
+    assert [t.rule for t in without.tasks] == ["Check-in default"]

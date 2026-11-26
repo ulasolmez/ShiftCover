@@ -20,7 +20,7 @@ curve, the way task-based demand works in GroundStar / Plan Control.
     per department such as DIY_RAMP, DIY_TRF … — tables and columns in any
     order, UTF-16/UTF-8/Windows-1254). Rule phases (arrival / departure /
     ground time), ground-time, pax, cargo, airline, domestic/international,
-    aircraft-group and flight-number-group filters are applied, and within an
+    aircraft-group and flight-number-group filters are applied (`THYA = TKJ` is preset: AJet's old THY group is today's TKJ), and within an
     engage group only the highest-priority matching rule is used. You pick the
     departments and whether to plan per qualification or per department; or
   * the simple task-rule table in the app (relative to STA/STD, NB/WB staff).
