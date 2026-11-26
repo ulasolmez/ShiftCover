@@ -52,6 +52,8 @@ class Task:
     staff: int = 1
     flight: str = ""
     location: str = ""
+    rule: str = ""               # source rule (engage-rule import)
+    department: str = ""         # resource type (engage-rule import)
 
     @property
     def slack(self) -> int:
@@ -470,12 +472,16 @@ def tasks_to_dataframe(tasks: List[Task]) -> pd.DataFrame:
     def _fmt(m):
         d, r = divmod(int(m), 1440)
         return f"{DAY_ABBR3[d % 7]} {r // 60:02d}:{r % 60:02d}"
-    return pd.DataFrame([{
+    df = pd.DataFrame([{
         "Task": t.name, "Occupation": t.occupation, "Flight": t.flight,
         "Location": t.location, "Earliest start": _fmt(t.earliest),
         "Latest end": _fmt(t.latest_end), "Duration (min)": t.duration,
         "Staff": t.staff, "Slack (min)": t.slack,
+        "Department": t.department, "Rule": t.rule,
     } for t in tasks])
+    if not df.empty and not (df["Rule"] != "").any():
+        df = df.drop(columns=["Department", "Rule"])
+    return df
 
 
 def task_list_csv(tasks: List[Task]) -> bytes:

@@ -24,6 +24,12 @@ from tasks import (
     generate_sample_flights, flights_to_dataframe, tasks_to_dataframe,
     task_list_csv, flights_csv, occupations_of, earliest_load, RULE_COLUMNS,
 )
+from groundstar_rules import (
+    decode_text, is_inform_flights, read_inform_flights, leg_week_starts,
+    build_events, events_dataframe, events_to_flights, flights_to_events,
+    read_engage_rules, rules_summary, referenced_groups, default_actype_groups,
+    parse_flight_number_groups, engage_tasks,
+)
 from task_solver import (
     TaskParams, TaskResult, solve_tasks, utilisation, task_hours,
     assignment_dataframe, workers_dataframe, build_task_report_xlsx,
@@ -229,6 +235,8 @@ params = TaskParams(
 
 
 def _set_tasks(new_tasks, source, flights=None):
+    if not source.startswith("flights"):
+        st.session_state.pop("build_info", None)
     st.session_state["tasks"] = new_tasks
     st.session_state["flights"] = flights
     st.session_state["occ_names"] = occupations_of(new_tasks)
@@ -274,11 +282,31 @@ def _read_tasks_cached(name, data, week, circ):
     return read_task_list(data, name, week, circ)
 
 
+@st.cache_data(show_spinner=False)
+def _read_inform_cached(data):
+    return read_inform_flights(data)
+
+
+@st.cache_data(show_spinner=False)
+def _read_rules_cached(data):
+    return read_engage_rules(data)
+
+
 with tab_fl:
-    st.info("Upload a **flight schedule** (.xlsx/.csv). The task rules above turn every "
-            "flight into tasks, like GroundStar demand rules.")
-    with st.expander("❓ Supported columns"):
+    st.info("Upload a **flight schedule** – the INFORM flight export (.txt) or a table "
+            "(.xlsx/.csv) – and, optionally, a **GroundStar engage-rule export**. "
+            "Without a rule export the task rules table above is used.")
+    with st.expander("❓ Supported files"):
         st.markdown("""
+**INFORM flight export (.txt)** – semicolon-separated, one row per leg, no header
+(as exported from INFORM). Arrival and departure of a rotation are linked through
+the linked-flight columns. Used: date, airline, flight number, A/D, linked flight,
+domestic/international, scheduled/charter, passenger/cargo, registration, aircraft
+type, stand, STA/STD, pax, seats, cargo + mail kg. If the file spans more than one
+Monday–Sunday week you pick the week.
+
+**Flight table (.xlsx/.csv)**
+
 | Column | Examples | |
 |---|---|---|
 | Flight | `Flight`, `Flight no`, `Arrival flight` | optional |
@@ -287,33 +315,136 @@ with tab_fl:
 | Category | `NB`/`WB`, or an aircraft type (`A321`, `B77W`) | optional (NB) |
 | Stand | `A12` | optional, used for travel time |
 
-STD earlier than STA on the same row means the aircraft departs after midnight.
-With dated rows from several weeks you pick the week.
+**GroundStar engage-rule export** (`PBEngageRule`, .csv/.txt) – one file with
+a table per resource type (DIY_RAMP, DIY_TRF, …). Each table may have its own
+columns in any order and the tables may come in any order; UTF-16, UTF-8 and
+Windows-1254 files are read. Rule phase 1 = arrival (relative to STA), 0 =
+departure (relative to STD), 2 = ground time (STA → STD). Within one engage
+group only the matching rule(s) with the highest priority are used, so
+airline-specific rules override the defaults.
 """)
-    f_up = st.file_uploader("Flight schedule", type=["xlsx", "xlsm", "csv"], key="fl_file")
+    f_up = st.file_uploader("Flight schedule", type=["txt", "xlsx", "xlsm", "csv"],
+                            key="fl_file")
+    r_up = st.file_uploader("Engage-rule export (optional)", type=["csv", "txt", "tsv"],
+                            key="rule_file")
+
+    events, fl = None, None
     if f_up is not None:
         try:
-            fl, warns, weeks = _read_flights_cached(f_up.name, f_up.getvalue(), None)
-            if len(weeks) > 1:
-                labels = [f"{w:%a %d %b %Y}" for w in weeks]
-                pick = st.selectbox("Week", labels, key="fl_week")
-                fl, warns, _ = _read_flights_cached(f_up.name, f_up.getvalue(),
-                                                    weeks[labels.index(pick)])
-            for w in warns:
-                st.warning(w)
-            st.caption(f"**{len(fl)}** flights read")
-            st.dataframe(flights_to_dataframe(fl).head(200), hide_index=True,
-                         width="stretch", height=220)
-            if st.button("Build tasks", key="btn_build", type="primary", disabled=not fl):
-                new, w2 = tasks_from_flights(fl, rules, circular)
-                for w in w2:
+            raw = f_up.getvalue()
+            if f_up.name.lower().endswith((".txt", ".csv")) and is_inform_flights(decode_text(raw)):
+                legs, warns = _read_inform_cached(raw)
+                weeks = leg_week_starts(legs)
+                labels = [f"{w:%a %d %b %Y} → {(w + pd.Timedelta(days=6)):%a %d %b}" for w in weeks]
+                week = weeks[0]
+                if len(weeks) > 1:
+                    pick = st.selectbox("Week", labels, key="fl_week_inf")
+                    week = weeks[labels.index(pick)]
+                events = build_events(legs, week)
+                for w in warns:
                     st.warning(w)
-                if new:
-                    _set_tasks(new, "flights", fl)
-                else:
-                    st.error("No tasks — check the task rules (Use ticked, staff > 0).")
+                n_rot = sum(1 for e in events if e.chained)
+                st.caption(f"INFORM export: **{len(legs)}** legs in the file · week "
+                           f"{labels[weeks.index(week)]}: **{n_rot}** rotations, "
+                           f"**{len(events) - n_rot}** single legs")
+                st.dataframe(events_dataframe(events), hide_index=True, width="stretch",
+                             height=220)
+                fl = events_to_flights(events)
+            else:
+                fl, warns, weeks = _read_flights_cached(f_up.name, raw, None)
+                if len(weeks) > 1:
+                    labels = [f"{w:%a %d %b %Y}" for w in weeks]
+                    pick = st.selectbox("Week", labels, key="fl_week")
+                    fl, warns, _ = _read_flights_cached(f_up.name, raw,
+                                                        weeks[labels.index(pick)])
+                for w in warns:
+                    st.warning(w)
+                st.caption(f"**{len(fl)}** flights read")
+                st.dataframe(flights_to_dataframe(fl).head(200), hide_index=True,
+                             width="stretch", height=220)
         except Exception as exc:
             st.error(f"{f_up.name}: {exc}")
+            fl = None
+
+    rules_df = None
+    if r_up is not None:
+        try:
+            rules_df, rwarns = _read_rules_cached(r_up.getvalue())
+            for w in rwarns:
+                st.warning(w)
+        except Exception as exc:
+            st.error(f"{r_up.name}: {exc}")
+
+    if rules_df is not None:
+        st.markdown(f"**Engage rules** – {len(rules_df)} rules in "
+                    f"{rules_df['Tab'].nunique()} tables")
+        summ = rules_summary(rules_df)
+        st.dataframe(summ, hide_index=True, width="stretch")
+        deps = list(summ["Department"])
+        default_dep = [d for d in deps if "RAMP" in d.upper()][:1] or deps[:1]
+        sel_deps = st.multiselect("Departments to plan", deps, default=default_dep,
+                                  key="rule_deps")
+        plan_by = st.radio("Plan per", ["Qualification", "Department"], horizontal=True,
+                           key="rule_plan_by",
+                           help="Qualification: one plan group per mandQual1 (e.g. "
+                                "DIY_W, DIY_DA). Department: all qualifications of a "
+                                "resource type pooled.")
+        grp_names = referenced_groups(rules_df, ["acTypeGroup", "notAcTypeGroup"])
+        ac_groups = {}
+        if events is not None and grp_names:
+            with st.expander("✈ Aircraft type groups", expanded=False):
+                st.caption("Which aircraft types belong to the groups used in the rules "
+                           "(acTypeGroup / notAcTypeGroup). Defaults are a guess — "
+                           "check them against GroundStar base data.")
+                legs_all = [l for e in events for l in (e.arr, e.dep) if l is not None]
+                ac_edit = st.data_editor(default_actype_groups(legs_all, grp_names),
+                                         key="ac_groups_editor", hide_index=True,
+                                         width="stretch",
+                                         disabled=["AC type", "Legs", "Seats"])
+                ac_groups = {r["AC type"]: {g for g in grp_names if bool(r[g])}
+                             for _, r in ac_edit.iterrows()}
+        fn_names = referenced_groups(rules_df[rules_df["ResourceType"].isin(sel_deps)],
+                                     ["flightNumberGroup"])
+        fn_text = ""
+        if fn_names:
+            with st.expander("🔢 Flight number groups", expanded=False):
+                st.caption("Rules use these flight-number groups: "
+                           + ", ".join(f"`{n}`" for n in fn_names)
+                           + ". One line per group, e.g. `THYA = THY2600-2699, THY2805`. "
+                             "Undefined groups match no flight.")
+                fn_text = st.text_area("Groups", "\n".join(f"{n} = " for n in fn_names),
+                                       key="fn_groups", label_visibility="collapsed")
+        if events is None and fl:
+            st.caption("With a flight table (not the INFORM export) pax, domestic/"
+                       "international and aircraft-group filters cannot be checked; "
+                       "rules that need them will not match.")
+
+    can_build = bool(fl) and (rules_df is None or bool(st.session_state.get("rule_deps")))
+    if f_up is not None and st.button("Build tasks", key="btn_build", type="primary",
+                                      disabled=not can_build):
+        if rules_df is not None:
+            evs = events if events is not None else flights_to_events(fl)
+            er = engage_tasks(evs, rules_df, sel_deps,
+                              "qualification" if plan_by == "Qualification" else "department",
+                              ac_groups, parse_flight_number_groups(fn_text), circular)
+            if er.tasks:
+                st.session_state["build_info"] = {"warnings": er.warnings,
+                                                  "summary": er.summary,
+                                                  "rule_use": er.rule_use}
+                _set_tasks(er.tasks, "flights + engage rules", fl)
+            else:
+                for w in er.warnings:
+                    st.warning(w)
+                st.error("No tasks — no rule of the chosen departments matches these flights.")
+        else:
+            new, w2 = tasks_from_flights(fl, rules, circular)
+            if new:
+                st.session_state["build_info"] = {"warnings": w2}
+                _set_tasks(new, "flights + task rules", fl)
+            else:
+                for w in w2:
+                    st.warning(w)
+                st.error("No tasks — check the task rules (Use ticked, staff > 0).")
 
 with tab_tl:
     st.info("Upload a **task list** (.xlsx/.csv) with one row per task, e.g. a GroundStar "
@@ -373,6 +504,13 @@ if tasks:
     src = st.session_state.get("task_source", "")
     flights = st.session_state.get("flights")
     st.success(f"Loaded {len(tasks):,} tasks ({src})")
+    info = st.session_state.get("build_info") or {}
+    for w in info.get("warnings", []):
+        st.warning(w)
+    if info.get("rule_use") is not None and not info["rule_use"].empty:
+        with st.expander("📐 Rules used", expanded=False):
+            st.dataframe(info["summary"], hide_index=True, width="stretch")
+            st.dataframe(info["rule_use"], hide_index=True, width="stretch", height=260)
     st.subheader("Task preview")
     tot_h = sum(t.duration * t.staff for t in tasks) / 60
     flex = sum(1 for t in tasks if t.slack > 0)
@@ -494,7 +632,7 @@ if res is not None and tasks:
     else:
         tmap = {t.tid: t for t in res.tasks}
         st.warning(f"{len(res.unassigned)} task(s) could not be staffed — no allowed shift "
-                   "can hold them (e.g. at the very end of a non-circular week): "
+                   "can hold them (e.g. at the very start or end of a non-circular week – turn on *Circular week*): "
                    + ", ".join(f"{tmap[i].name} {tmap[i].flight}" for i in res.unassigned[:10]))
     if res.extended_shifts or res.extra_workers:
         st.info(f"The assignment check lengthened **{res.extended_shifts}** shift(s) and added "

@@ -13,10 +13,17 @@ curve, the way task-based demand works in GroundStar / Plan Control.
 
 ## Input
 
-* **Flights + task rules** – upload a flight schedule (Flight, Day, STA, STD,
-  Category/AC type, Stand). Task rules relative to STA/STD turn each flight
-  into tasks, e.g. *Unloading: STA+0 … STA+40, 20 min, 3 staff (NB) / 5 (WB)*.
-  The rules are editable in the app.
+* **Flights + task rules** – upload a flight schedule: the **INFORM flight
+  export (.txt)** or a table (Flight, Day, STA, STD, Category/AC type, Stand).
+  Tasks come from either
+  * a **GroundStar engage-rule export** (`PBEngageRule`, one file with a table
+    per department such as DIY_RAMP, DIY_TRF … — tables and columns in any
+    order, UTF-16/UTF-8/Windows-1254). Rule phases (arrival / departure /
+    ground time), ground-time, pax, cargo, airline, domestic/international,
+    aircraft-group and flight-number-group filters are applied, and within an
+    engage group only the highest-priority matching rule is used. You pick the
+    departments and whether to plan per qualification or per department; or
+  * the simple task-rule table in the app (relative to STA/STD, NB/WB staff).
 * **Task list** – upload one row per task (Earliest start, Latest end,
   Duration, Staff, Qualification, Flight, Location).
 * **Generate sample** – a hub-style week with arrival/departure banks.
@@ -59,6 +66,7 @@ part of the `ortools` wheel.
 |---|---|
 | `app.py` | Streamlit front-end (task-based) |
 | `tasks.py` | Tasks, flights, task rules, imports, sample schedule |
+| `groundstar_rules.py` | INFORM flight export + GroundStar engage-rule export → tasks |
 | `task_solver.py` | Model, assignment check, repair, reports |
 | `solver.py` | Shared shift machinery from the curve-based Simplex |
-| `test_task_solver.py` | Tests for the task-based parts |
+| `test_task_solver.py`, `test_groundstar_rules.py` | Tests for the task-based parts |
