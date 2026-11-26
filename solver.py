@@ -1078,7 +1078,11 @@ def shift_type_summary(
     return pd.DataFrame(rows)
 
 
-def build_weekly_report_xlsx(result: MultiCurveResult) -> bytes:
+def build_weekly_report_xlsx(
+    result: MultiCurveResult,
+    extra_sheets: Optional[Dict[str, pd.DataFrame]] = None,
+) -> bytes:
+    """Shift Types, Coverage and ERP Shifttype sheets (+ optional extras)."""
     buf = _io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
 
@@ -1101,5 +1105,8 @@ def build_weekly_report_xlsx(result: MultiCurveResult) -> bytes:
                            index=False, startrow=1)
             ws_st = writer.sheets["Shifttype"]
             ws_st.write(0, 0, _SHIFTTYPE_HEADER)
+
+        for name, df in (extra_sheets or {}).items():
+            df.to_excel(writer, sheet_name=name[:31], index=False)
 
     return buf.getvalue()

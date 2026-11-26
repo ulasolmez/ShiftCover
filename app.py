@@ -1,11 +1,14 @@
 """
-ShiftCover – Streamlit front-end
-================================
-Supports 1-5 occupation workload curves with shared shift structures.
+Simplex (task-based) – Streamlit front-end
+==========================================
+Same layout and shift rules as the curve-based Simplex, but the input is a
+list of tasks (from a flight schedule + task rules, a task list, or a
+sample).  The optimiser picks each task's start time and the shifts
+together, then checks that every task can be given to one worker.
 """
 
-import io
 import dataclasses
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -14,19 +17,22 @@ import streamlit as st
 from solver import (
     INTERVALS_PER_DAY, INTERVALS_PER_HOUR, TOTAL_INTERVALS,
     DAY_NAMES, OCC_COLORS,
-    SolverParams, MultiCurveResult,
-    solve_multi, list_possible_shift_codes,
-    coverage_dataframe, shifts_to_dataframe,
-    shift_type_summary, build_weekly_report_xlsx,
-    daily_entry_headcount, max_headcount,
-    buffer_violations,
+    list_possible_shift_codes, daily_entry_headcount, max_headcount,
 )
-from sample_data import generate_sample_demand
-from groundstar_import import read_workload_file, curve_week, combine_by_occupation
+from tasks import (
+    default_rules, read_flights, read_task_list, tasks_from_flights,
+    generate_sample_flights, flights_to_dataframe, tasks_to_dataframe,
+    task_list_csv, flights_csv, occupations_of, earliest_load, RULE_COLUMNS,
+)
+from task_solver import (
+    TaskParams, TaskResult, solve_tasks, utilisation, task_hours,
+    assignment_dataframe, workers_dataframe, build_task_report_xlsx,
+    shift_types,
+)
 
 # ── Page config ──────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Simplex", layout="wide")
-st.title("🕐 Simplex – Weekly Shift Optimiser")
+st.set_page_config(page_title="Simplex Tasks", layout="wide")
+st.title("🕐 Simplex – Task-based Shift Optimiser")
 
 st.markdown("""
 <style>
@@ -42,30 +48,19 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-MAX_CURVES = 10
-
-# ── Apply occupations from an import (before the sidebar widgets exist) ─────
-if st.session_state.get("_pending_occ"):
-    _names = st.session_state.pop("_pending_occ")
-    st.session_state["n_curves"] = len(_names)
-    for _i, _n in enumerate(_names):
-        st.session_state[f"occ_name_{_i}"] = _n
+DAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+x5 = list(range(TOTAL_INTERVALS))
+tasks = st.session_state.get("tasks")
+occ_names: list = st.session_state.get("occ_names") or []
+n_occ_in = len(occ_names)
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Parameters")
-
-    st.session_state.setdefault("n_curves", 1)
-    n_curves = st.number_input("Number of occupation curves", 1, MAX_CURVES,
-                               key="n_curves",
-                               help="Set automatically when you load a workload import.")
-    occ_names = []
-    _default_names = (["Technician", "Labourer", "Helper", "Supervisor", "Assistant"]
-                      + [f"Occupation {k}" for k in range(6, MAX_CURVES + 1)])
-    for i in range(n_curves):
-        st.session_state.setdefault(f"occ_name_{i}", _default_names[i])
-        name = st.text_input(f"Occupation {i+1} name", key=f"occ_name_{i}")
-        occ_names.append(name)
+    if occ_names:
+        st.caption("Occupations (from the tasks): " + ", ".join(f"**{n}**" for n in occ_names))
+    else:
+        st.caption("Occupations come from the tasks — load or generate tasks first.")
 
     with st.expander("⚙ Shift settings", expanded=True):
         min_shift = st.slider("Min shift (h)", 3.0, 8.0, 3.0, 0.5)
@@ -89,480 +84,344 @@ with st.sidebar:
             st.session_state["slot_filter"] = _HOURLY_SLOTS[:]
             st.rerun()
         allowed_slots_sel = st.multiselect(
-            "Allowed times (start & end)",
-            options=_ALL_SLOTS,
-            key="slot_filter",
-        )
+            "Allowed times (start & end)", options=_ALL_SLOTS, key="slot_filter")
         allowed_slot_minutes = (
             [int(t[:2]) * 60 + int(t[3:]) for t in allowed_slots_sel]
             if len(allowed_slots_sel) < 48 else None
         )
 
-    # Build list of possible shift codes based on current settings
-    _preview_params = SolverParams(
+    _preview_params = TaskParams(
         min_shift_hours=min_shift, max_shift_hours=max_shift,
         shift_start_granularity_min=30, shift_duration_step_min=30,
-        exclude_night_shifts=no_night,
-        allowed_slot_minutes=allowed_slot_minutes,
+        exclude_night_shifts=no_night, allowed_slot_minutes=allowed_slot_minutes,
     )
     _all_codes = list_possible_shift_codes(_preview_params)
 
     with st.expander(f"✅ Force include / exclude  ({len(_all_codes)} patterns)", expanded=False):
-        st.markdown("""<style>
-        div:has(> .green-ms) + div [data-baseweb="tag"] {
-            background-color: #2e7d32 !important; color: white !important;
-        }
-        div:has(> .green-ms) + div [data-baseweb="tag"] span,
-        div:has(> .green-ms) + div [data-baseweb="tag"] svg {
-            color: white !important; fill: white !important;
-        }
-        div:has(> .red-ms) + div [data-baseweb="tag"] {
-            background-color: #c62828 !important; color: white !important;
-        }
-        div:has(> .red-ms) + div [data-baseweb="tag"] span,
-        div:has(> .red-ms) + div [data-baseweb="tag"] svg {
-            color: white !important; fill: white !important;
-        }
-        </style>""", unsafe_allow_html=True)
-        st.markdown('<span class="green-ms"></span>', unsafe_allow_html=True)
-        force_incl = st.multiselect(
-            "Must include (solver will always use these)",
-            options=_all_codes, default=[], key="force_incl")
-        _excl_options = [c for c in _all_codes if c not in set(force_incl)]
-        st.markdown('<span class="red-ms"></span>', unsafe_allow_html=True)
-        force_excl = st.multiselect(
-            "Must exclude (solver will never use these)",
-            options=_excl_options, default=[], key="force_excl")
-        _conflict = set(force_incl) & set(force_excl)
-        if _conflict:
-            st.warning(f"Conflict: {', '.join(sorted(_conflict))} in both lists")
-
-
-    DAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        force_incl = st.multiselect("Must include (solver will always use these)",
+                                    options=_all_codes, default=[], key="force_incl")
+        force_excl = st.multiselect("Must exclude (solver will never use these)",
+                                    options=[c for c in _all_codes if c not in set(force_incl)],
+                                    default=[], key="force_excl")
 
     with st.expander("📅 Entry / Exit limits per day", expanded=False):
         st.caption("Max distinct start times (entries) and end times (exits) "
                    "per day. 0 = unlimited.")
-        max_entries = []
-        max_exits = []
+        max_entries, max_exits = [], []
         for d in range(7):
-            col_e, col_x = st.columns(2)
-            with col_e:
-                e = st.number_input(f"{DAY_SHORT[d]} entries",
-                                    0, 48, 0, key=f"ent_{d}")
-                max_entries.append(e)
-            with col_x:
-                x = st.number_input(f"{DAY_SHORT[d]} exits",
-                                    0, 48, 0, key=f"ext_{d}")
-                max_exits.append(x)
+            ce, cx = st.columns(2)
+            max_entries.append(ce.number_input(f"{DAY_SHORT[d]} entries", 0, 48, 0, key=f"ent_{d}"))
+            max_exits.append(cx.number_input(f"{DAY_SHORT[d]} exits", 0, 48, 0, key=f"ext_{d}"))
     use_entries = any(v > 0 for v in max_entries)
     use_exits = any(v > 0 for v in max_exits)
 
     with st.expander("👥 Headcount limits per day (combined)", expanded=False):
         st.caption("Max and min workers entering shifts (all occupations combined) "
-                   "per day — counts workers whose shift STARTS on the day. "
-                   "0 = unlimited / no minimum.")
-        max_hc = []
-        min_hc = []
+                   "per day. 0 = unlimited / no minimum.")
+        max_hc, min_hc = [], []
         for d in range(7):
-            col_max, col_min = st.columns(2)
-            with col_max:
-                mx = st.number_input(f"{DAY_SHORT[d]} max",
-                                     0, 500, 0, key=f"hc_{d}")
-                max_hc.append(mx)
-            with col_min:
-                mn = st.number_input(f"{DAY_SHORT[d]} min",
-                                     0, 500, 0, key=f"min_hc_{d}")
-                min_hc.append(mn)
+            cm, cn = st.columns(2)
+            max_hc.append(cm.number_input(f"{DAY_SHORT[d]} max", 0, 500, 0, key=f"hc_{d}"))
+            min_hc.append(cn.number_input(f"{DAY_SHORT[d]} min", 0, 500, 0, key=f"min_hc_{d}"))
     use_hc = any(v > 0 for v in max_hc)
     use_min_hc = any(v > 0 for v in min_hc)
 
-    # Per-occupation daily headcount limits
-    occ_max_hc: list = []
-    with st.expander("👤 Max headcount per occupation per day", expanded=False):
-        st.caption("Set how many workers of each occupation can enter a shift "
-                   "per day. 0 = unlimited (use combined limit or no restriction).")
-        for i in range(n_curves):
-            st.markdown(f"**{occ_names[i]}**")
-            occ_daily = []
-            cols = st.columns(7)
-            for d in range(7):
-                with cols[d]:
-                    st.caption(DAY_SHORT[d])
-                    v = st.number_input(
-                        f"##{occ_names[i]}_{DAY_SHORT[d]}",
-                        0, 500, 0,
-                        key=f"occ_hc_{i}_{d}",
-                        label_visibility="collapsed",
-                    )
-                    occ_daily.append(v)
-            # 0 = unlimited (no constraint applied in solver)
-            occ_max_hc.append(occ_daily if any(v > 0 for v in occ_daily) else None)
-    use_occ_hc = any(v is not None for v in occ_max_hc)
+    def _per_occ_days(title, key, caption):
+        out = []
+        with st.expander(title, expanded=False):
+            st.caption(caption)
+            if not occ_names:
+                st.caption("Load tasks first.")
+            for i, name in enumerate(occ_names):
+                st.markdown(f"**{name}**")
+                cols = st.columns(7)
+                vals = []
+                for d in range(7):
+                    with cols[d]:
+                        st.caption(DAY_SHORT[d])
+                        vals.append(st.number_input(f"##{key}_{name}_{d}", 0, 500, 0,
+                                                    key=f"{key}_{name}_{d}",
+                                                    label_visibility="collapsed"))
+                out.append(vals if any(v > 0 for v in vals) else None)
+        return out
 
-    # Per-occupation daily minimum headcount
-    occ_min_hc: list = []
-    with st.expander("👤 Min headcount per occupation per day", expanded=False):
-        st.caption("Set a minimum number of workers of each occupation that must "
-                   "enter a shift per day. 0 = no minimum.")
-        for i in range(n_curves):
-            st.markdown(f"**{occ_names[i]}**")
-            occ_daily_min = []
-            cols = st.columns(7)
-            for d in range(7):
-                with cols[d]:
-                    st.caption(DAY_SHORT[d])
-                    v = st.number_input(
-                        f"##min_{occ_names[i]}_{DAY_SHORT[d]}",
-                        0, 500, 0,
-                        key=f"occ_min_hc_{i}_{d}",
-                        label_visibility="collapsed",
-                    )
-                    occ_daily_min.append(v)
-            occ_min_hc.append(occ_daily_min if any(v > 0 for v in occ_daily_min) else None)
-    use_occ_min_hc = any(v is not None for v in occ_min_hc)
+    occ_max_hc = _per_occ_days("👤 Max headcount per occupation per day", "occ_hc",
+                               "Workers of each occupation that may enter a shift per day. "
+                               "0 = unlimited.")
+    occ_min_hc = _per_occ_days("👤 Min headcount per occupation per day", "occ_min_hc",
+                               "Minimum workers of each occupation entering a shift per day. "
+                               "0 = no minimum.")
 
-    # Per-occupation per-shift-code headcount limits
     occ_sc_hc: list = []
     with st.expander("🕐 Shift-type headcount limits", expanded=False):
-        st.caption("Set daily max/min workers per shift code per occupation. "
-                   "Select a shift code, then configure per-day limits. "
-                   "0 = unlimited / no minimum. "
-                   "Leave unselected codes unconstrained.")
-        for i in range(n_curves):
-            st.markdown(f"**{occ_names[i]}**")
-            # Let user select which shift codes to constrain for this occupation
-            selected_codes = st.multiselect(
-                f"Shift codes to constrain for {occ_names[i]}",
-                options=_all_codes,
-                default=[],
-                key=f"sc_hc_codes_{i}",
-            )
-            if selected_codes:
-                sc_dict = {}
-                for code in selected_codes:
-                    st.caption(f"  {code}")
-                    max_daily = []
-                    min_daily = []
-                    # Day header row (first column empty for label)
-                    hdr_cols = st.columns([0.4, 1, 1, 1, 1, 1, 1, 1])
-                    with hdr_cols[0]:
-                        st.caption("")
-                    for d in range(7):
-                        with hdr_cols[d + 1]:
-                            st.caption(DAY_SHORT[d])
-                    # Max row
-                    max_cols = st.columns([0.4, 1, 1, 1, 1, 1, 1, 1])
-                    with max_cols[0]:
-                        st.caption("Max")
-                    for d in range(7):
-                        with max_cols[d + 1]:
-                            mx = st.number_input(
-                                f"max_{i}_{code}_{d}", 0, 500, 0,
-                                key=f"sc_hc_max_{i}_{code.replace('-','_')}_{d}",
-                                label_visibility="collapsed",
-                            )
-                            max_daily.append(mx)
-                    # Min row
-                    min_cols = st.columns([0.4, 1, 1, 1, 1, 1, 1, 1])
-                    with min_cols[0]:
-                        st.caption("Min")
-                    for d in range(7):
-                        with min_cols[d + 1]:
-                            mn = st.number_input(
-                                f"min_{i}_{code}_{d}", 0, 500, 0,
-                                key=f"sc_hc_min_{i}_{code.replace('-','_')}_{d}",
-                                label_visibility="collapsed",
-                            )
-                            min_daily.append(mn)
-                    has_max = any(v > 0 for v in max_daily)
-                    has_min = any(v > 0 for v in min_daily)
-                    if has_max or has_min:
-                        sc_dict[code] = {}
-                        if has_max:
-                            sc_dict[code]["max"] = max_daily
-                        if has_min:
-                            sc_dict[code]["min"] = min_daily
-                occ_sc_hc.append(sc_dict if sc_dict else None)
-            else:
-                occ_sc_hc.append(None)
-    use_occ_sc_hc = any(v is not None for v in occ_sc_hc)
+        st.caption("Daily max/min workers per shift code per occupation. 0 = unlimited / no minimum.")
+        if not occ_names:
+            st.caption("Load tasks first.")
+        for i, name in enumerate(occ_names):
+            st.markdown(f"**{name}**")
+            codes = st.multiselect(f"Shift codes to constrain for {name}", options=_all_codes,
+                                   default=[], key=f"sc_hc_codes_{name}")
+            sc = {}
+            for code in codes:
+                st.caption(f"  {code}")
+                hdr = st.columns([0.4] + [1] * 7)
+                for d in range(7):
+                    hdr[d + 1].caption(DAY_SHORT[d])
+                mxr, mnr = st.columns([0.4] + [1] * 7), st.columns([0.4] + [1] * 7)
+                mxr[0].caption("Max")
+                mnr[0].caption("Min")
+                mx = [mxr[d + 1].number_input("max", 0, 500, 0, label_visibility="collapsed",
+                                              key=f"sc_max_{name}_{code}_{d}") for d in range(7)]
+                mn = [mnr[d + 1].number_input("min", 0, 500, 0, label_visibility="collapsed",
+                                              key=f"sc_min_{name}_{code}_{d}") for d in range(7)]
+                spec = {}
+                if any(mx):
+                    spec["max"] = mx
+                if any(mn):
+                    spec["min"] = mn
+                if spec:
+                    sc[code] = spec
+            occ_sc_hc.append(sc or None)
 
-    with st.expander("⏱ Operational buffers", expanded=True):
-        st.caption("Real-world lead/lag around the workload curve. "
-                   "Set to 0 to get the raw mathematical minimum.")
-        prep_lead = st.number_input(
-            "Prep before operation start (min)", 0, 120, 30, 5,
-            help="Workers must be on shift this long before workload rises. "
-                 "Operation at 08:30 → shift starts 08:00.")
-        exit_lag = st.number_input(
-            "Stay after operation end (min)", 0, 120, 30, 5,
-            help="Workers stay this long after workload drops. "
-                 "Operation ends 17:00 → shift ends 17:30.")
-        handover = st.number_input(
-            "Handover overlap (min)", 0, 120, 30, 5,
-            help="When a worker leaves while the operation continues, "
-                 "the replacement arrives this much earlier so both overlap.")
+    with st.expander("🧭 Task work rules", expanded=True):
+        st.caption("How a worker's time on shift can be used for tasks.")
+        briefing = st.number_input("Briefing at shift start (min)", 0, 60, 15, 5,
+                                   help="No tasks in the first minutes of a shift "
+                                        "(briefing, equipment pick-up).")
+        closeout = st.number_input("Close-out at shift end (min)", 0, 60, 10, 5,
+                                   help="No tasks in the last minutes of a shift "
+                                        "(equipment return, handover).")
+        travel = st.number_input("Travel between stands (min)", 0, 30, 5, 5,
+                                 help="Walking/driving time before each task; "
+                                      "none between two tasks at the same stand.")
+        breaks = st.checkbox("Plan breaks (30 min from 4 h, 60 min from 8 h)", value=True,
+                             help="The break may sit anywhere in the middle half of the shift; "
+                                  "no task during the break.")
+        max_opts = st.slider("Start times tried per task", 1, 25, 13,
+                             help="Tasks with a time window get this many evenly spread start "
+                                  "options. 1 = every task starts as early as it can.")
 
     with st.expander("🔧 Solver", expanded=False):
-        time_limit = st.number_input("Time limit (s)", 10, 600, 120, 10)
+        time_limit = st.number_input("Time limit (s)", 20, 600, 120, 10)
         t_penalty = st.number_input("Transition penalty", 0, 500, 50, 10)
+        rounds = st.number_input("Assignment-check rounds", 0, 5, 3, 1,
+                                 help="If a task cannot be given to one worker, the shift "
+                                      "plan is solved again with an extra rule for it.")
 
-params = SolverParams(
-    min_shift_hours=min_shift,
-    max_shift_hours=max_shift,
-    shift_start_granularity_min=30,
-    shift_duration_step_min=30,
-    max_unique_shifts=max_unique,
-    transition_penalty=t_penalty,
+params = TaskParams(
+    min_shift_hours=min_shift, max_shift_hours=max_shift,
+    shift_start_granularity_min=30, shift_duration_step_min=30,
+    max_unique_shifts=max_unique, transition_penalty=t_penalty,
     solver_time_limit_sec=time_limit,
     max_entries_per_day=max_entries if use_entries else None,
     max_exits_per_day=max_exits if use_exits else None,
     max_headcount_per_day=max_hc if use_hc else None,
     min_headcount_per_day=min_hc if use_min_hc else None,
-    occ_max_headcount_per_day=occ_max_hc if use_occ_hc else None,
-    occ_min_headcount_per_day=occ_min_hc if use_occ_min_hc else None,
-    occ_headcount_per_shift_code=occ_sc_hc if use_occ_sc_hc else None,
-    exclude_night_shifts=no_night,
-    circular_week=circular,
-    force_include_shifts=force_incl if force_incl else None,
-    force_exclude_shifts=force_excl if force_excl else None,
+    occ_max_headcount_per_day=occ_max_hc if any(v is not None for v in occ_max_hc) else None,
+    occ_min_headcount_per_day=occ_min_hc if any(v is not None for v in occ_min_hc) else None,
+    occ_headcount_per_shift_code=occ_sc_hc if any(v is not None for v in occ_sc_hc) else None,
+    exclude_night_shifts=no_night, circular_week=circular,
+    force_include_shifts=force_incl or None, force_exclude_shifts=force_excl or None,
     allowed_slot_minutes=allowed_slot_minutes,
-    prep_lead_min=int(prep_lead),
-    exit_lag_min=int(exit_lag),
-    handover_overlap_min=int(handover),
+    briefing_min=int(briefing), closeout_min=int(closeout), travel_min=int(travel),
+    breaks=breaks, assign_rounds=int(rounds), max_task_options=int(max_opts),
 )
 
 
-# ── Demand input ─────────────────────────────────────────────────────────────
-st.header("📂 Demand input")
+def _set_tasks(new_tasks, source, flights=None):
+    st.session_state["tasks"] = new_tasks
+    st.session_state["flights"] = flights
+    st.session_state["occ_names"] = occupations_of(new_tasks)
+    st.session_state["task_source"] = source
+    st.rerun()
 
-tab_upload, tab_sample = st.tabs(["⬆ Upload files", "🎲 Generate sample"])
 
-with tab_upload:
-    st.info("Drop your **GroundStar workload exports** (.xlsx with a *Curve Data* "
-            "sheet) — one or several departments at once. Plain CSV/XLSX curves "
-            f"with {TOTAL_INTERVALS} rows still work too.")
-    with st.expander("❓ Supported files"):
-        st.markdown(f"""
-**GroundStar workload export (recommended)** — export the workload curve from
-GroundStar Planning to Excel and upload the file as is. The *Curve Data* sheet is
-read directly: metadata, the time step and every curve column (one per resource
-type / qualification, depending on *Curve Building Criteria*).
+# ── Task input ───────────────────────────────────────────────────────────────
+st.header("📂 Task input")
 
-* Each curve becomes a row in the table below. Set its **Occupation** — this is
-  the classification the optimiser plans for (e.g. `DCL`, `CLN`, `INF`).
-* Rows with the **same occupation** are summed (e.g. two files for one department).
-* Untick **Use** to leave a curve out.
-* If the export spans more than one Monday–Sunday week, pick the week per file.
-* 15/30/60-min exports are converted to 5-min steps; fractional workload is
-  rounded **up**.
+if "rules" not in st.session_state:
+    st.session_state["rules"] = default_rules()
+with st.expander("📋 Task rules (relative to STA / STD)", expanded=False):
+    st.caption("Used for **Flights + task rules** and **Generate sample**. "
+               "A task may start at Ref + From at the earliest and must be finished "
+               "by Ref + To. When To − From equals the duration, the task is fixed. "
+               "Staff depends on the aircraft category (NB = narrow-body, WB = wide-body). "
+               "Add rows for more tasks; untick **Use** to leave one out.")
+    rules = st.data_editor(
+        st.session_state["rules"], key="rules_editor", num_rows="dynamic",
+        hide_index=True, width="stretch",
+        column_config={
+            "Use": st.column_config.CheckboxColumn(width="small"),
+            "Ref": st.column_config.SelectboxColumn(options=["STA", "STD"], width="small"),
+            "From (min)": st.column_config.NumberColumn(step=5),
+            "To (min)": st.column_config.NumberColumn(step=5),
+            "Duration (min)": st.column_config.NumberColumn(min_value=5, step=5),
+            "Staff NB": st.column_config.NumberColumn(min_value=0, step=1),
+            "Staff WB": st.column_config.NumberColumn(min_value=0, step=1),
+        })
+    rules = rules.dropna(subset=["Occupation", "Task", "Ref"])[RULE_COLUMNS]
 
-**Plain curve** — `.csv`/`.xlsx`, one numeric column (`Required`, `Demand`,
-`Workers`, …) with exactly **{TOTAL_INTERVALS}** rows, Monday 00:00 → Sunday 23:55
-in 5-min steps.
+tab_fl, tab_tl, tab_sample = st.tabs(["✈ Flights + task rules", "⬆ Task list", "🎲 Generate sample"])
+
+
+@st.cache_data(show_spinner=False)
+def _read_flights_cached(name, data, week):
+    return read_flights(data, name, week)
+
+
+@st.cache_data(show_spinner=False)
+def _read_tasks_cached(name, data, week, circ):
+    return read_task_list(data, name, week, circ)
+
+
+with tab_fl:
+    st.info("Upload a **flight schedule** (.xlsx/.csv). The task rules above turn every "
+            "flight into tasks, like GroundStar demand rules.")
+    with st.expander("❓ Supported columns"):
+        st.markdown("""
+| Column | Examples | |
+|---|---|---|
+| Flight | `Flight`, `Flight no`, `Arrival flight` | optional |
+| Day | `Mon`, `Monday`, `1`–`7` or a date | needed if STA/STD are clock times |
+| STA / STD | `07:35`, `0735` or a date-time | at least one |
+| Category | `NB`/`WB`, or an aircraft type (`A321`, `B77W`) | optional (NB) |
+| Stand | `A12` | optional, used for travel time |
+
+STD earlier than STA on the same row means the aircraft departs after midnight.
+With dated rows from several weeks you pick the week.
 """)
-
-    up_files = st.file_uploader(
-        "Workload files", type=["xlsx", "xlsm", "csv"],
-        accept_multiple_files=True, key="wl_files")
-
-    @st.cache_data(show_spinner=False)
-    def _read_cached(name: str, data: bytes):
-        return read_workload_file(_NamedBytes(data, name))
-
-    class _NamedBytes(io.BytesIO):
-        def __init__(self, data, name):
-            super().__init__(data)
-            self.name = name
-
-    parsed = []
-    for f in up_files or []:
+    f_up = st.file_uploader("Flight schedule", type=["xlsx", "xlsm", "csv"], key="fl_file")
+    if f_up is not None:
         try:
-            parsed.append(_read_cached(f.name, f.getvalue()))
-        except Exception as exc:
-            st.error(f"{f.name}: {exc}")
-
-    if parsed:
-        rows, curve_refs = [], []
-        for fi, wf in enumerate(parsed):
-            for w in wf.warnings:
+            fl, warns, weeks = _read_flights_cached(f_up.name, f_up.getvalue(), None)
+            if len(weeks) > 1:
+                labels = [f"{w:%a %d %b %Y}" for w in weeks]
+                pick = st.selectbox("Week", labels, key="fl_week")
+                fl, warns, _ = _read_flights_cached(f_up.name, f_up.getvalue(),
+                                                    weeks[labels.index(pick)])
+            for w in warns:
                 st.warning(w)
-            week = None
-            if wf.kind == "groundstar":
-                starts = wf.week_starts()
-                meta_bits = [f"**{wf.file_name}**"]
-                if wf.resource_type:
-                    meta_bits.append(f"resource type `{wf.resource_type}`")
-                if wf.meta.get("Curve Building Criteria"):
-                    meta_bits.append(f"curves by *{wf.meta['Curve Building Criteria']}*")
-                if starts:
-                    labels = [f"{d:%a %d %b %Y} → {(d + pd.Timedelta(days=6)):%a %d %b}"
-                              for d in starts]
-                    if len(starts) > 1:
-                        pick = st.selectbox(f"Week for {wf.file_name}", labels,
-                                            key=f"wl_week_{fi}_{wf.file_name}")
-                        week = starts[labels.index(pick)]
-                    else:
-                        week = starts[0]
-                        meta_bits.append(f"week {labels[0]}")
+            st.caption(f"**{len(fl)}** flights read")
+            st.dataframe(flights_to_dataframe(fl).head(200), hide_index=True,
+                         width="stretch", height=220)
+            if st.button("Build tasks", key="btn_build", type="primary", disabled=not fl):
+                new, w2 = tasks_from_flights(fl, rules, circular)
+                for w in w2:
+                    st.warning(w)
+                if new:
+                    _set_tasks(new, "flights", fl)
                 else:
-                    meta_bits.append("no full Mon–Sun week — weekdays mapped from "
-                                     "their first occurrence")
-                st.caption(" · ".join(meta_bits))
-            default = {id(c) for c in wf.default_curves()}
-            for c in wf.curves:
-                d = curve_week(c, week)
-                occ = c.name if c.role in ("Standard", "Plain") else (
-                    wf.resource_type or c.name)
-                rows.append({
-                    "Use": id(c) in default,
-                    "Occupation": occ,
-                    "File": wf.file_name,
-                    "Curve": c.name,
-                    "Type": c.role,
-                    "Peak": int(d.max()),
-                    "Workload h": round(d.sum() / 12, 1),
-                })
-                curve_refs.append(d)
+                    st.error("No tasks — check the task rules (Use ticked, staff > 0).")
+        except Exception as exc:
+            st.error(f"{f_up.name}: {exc}")
 
-        _sig = "|".join(f"{wf.file_name}:{len(wf.curves)}" for wf in parsed)
-        edited = st.data_editor(
-            pd.DataFrame(rows), key=f"wl_table_{hash(_sig)}",
-            hide_index=True, width="stretch",
-            disabled=["File", "Curve", "Type", "Peak", "Workload h"],
-            column_config={
-                "Use": st.column_config.CheckboxColumn(width="small"),
-                "Occupation": st.column_config.TextColumn(
-                    help="Classification to plan for. Same name = curves summed."),
-            })
-
-        sel = [{"occupation": r["Occupation"], "demand": curve_refs[i]}
-               for i, r in edited.iterrows() if r["Use"] and str(r["Occupation"]).strip()]
-        combined = combine_by_occupation(sel)
-        if combined:
-            st.caption("Will load: " + ", ".join(
-                f"**{n}** (peak {int(d.max())}, {d.sum() / 12:,.0f} h)"
-                for n, d in combined.items()))
-        if st.button("Load workload", key="btn_load", type="primary",
-                     disabled=not combined):
-            if len(combined) > MAX_CURVES:
-                st.error(f"{len(combined)} occupations selected — max is {MAX_CURVES}.")
-            else:
-                st.session_state["demands"] = list(combined.values())
-                st.session_state["occ_names"] = list(combined.keys())
-                st.session_state["_pending_occ"] = list(combined.keys())
-                st.session_state["demand_source"] = "import"
-                st.rerun()
-    if (st.session_state.get("demand_source") == "import"
-            and st.session_state.get("demands") is not None):
-        st.success("Loaded: " + ", ".join(st.session_state["occ_names"]))
+with tab_tl:
+    st.info("Upload a **task list** (.xlsx/.csv) with one row per task, e.g. a GroundStar "
+            "task export.")
+    with st.expander("❓ Supported columns"):
+        st.markdown("""
+| Column | Examples | |
+|---|---|---|
+| Task | `Task`, `Name`, `Activity` | optional |
+| Occupation | `Qualification`, `Skill`, `Resource`, `Department` | optional (one group) |
+| Day | `Mon` or a date | needed if times are clock times |
+| Earliest start | `Earliest start`, `Start`, `Begin` | required |
+| Latest end | `Latest end`, `End`, `Finish` | required |
+| Duration (min) | `Duration` | optional (= end − start, a fixed task) |
+| Staff | `Staff`, `Quantity`, `Persons` | optional (1) |
+| Flight, Location | `Flight`, `Stand` | optional |
+""")
+    t_up = st.file_uploader("Task list", type=["xlsx", "xlsm", "csv"], key="tl_file")
+    if t_up is not None:
+        try:
+            tl, warns, weeks = _read_tasks_cached(t_up.name, t_up.getvalue(), None, circular)
+            if len(weeks) > 1:
+                labels = [f"{w:%a %d %b %Y}" for w in weeks]
+                pick = st.selectbox("Week", labels, key="tl_week")
+                tl, warns, _ = _read_tasks_cached(t_up.name, t_up.getvalue(),
+                                                  weeks[labels.index(pick)], circular)
+            for w in warns:
+                st.warning(w)
+            st.caption(f"**{len(tl)}** tasks read")
+            st.dataframe(tasks_to_dataframe(tl).head(200), hide_index=True,
+                         width="stretch", height=220)
+            if st.button("Load tasks", key="btn_load_tasks", type="primary", disabled=not tl):
+                _set_tasks(tl, "task list")
+        except Exception as exc:
+            st.error(f"{t_up.name}: {exc}")
 
 with tab_sample:
-    cols_sample = st.columns(n_curves)
-    peaks = []
-    bases = []
-    for i, col in enumerate(cols_sample):
-        with col:
-            st.markdown(f"**{occ_names[i]}**")
-            pk = st.slider(f"Peak agents", 5, 60, max(5, 25 - i * 8),
-                           key=f"peak_{i}")
-            bs = st.slider(f"Base agents", 0, 10, max(1, 3 - i),
-                           key=f"base_{i}")
-            peaks.append(pk)
-            bases.append(bs)
-    sample_seed = st.number_input("Random seed", 0, 9999, 42)
-
+    c1, c2, c3 = st.columns(3)
+    fpd = c1.slider("Flights per weekday", 5, 60, 20,
+                    help="Weekends get about 25 % fewer flights.")
+    wb = c2.slider("Wide-body share (%)", 0, 50, 15)
+    seed = c3.number_input("Random seed", 0, 9999, 42)
+    st.caption("A hub-style week with arrival/departure banks. Tasks come from the "
+               "task rules above (by default Ramp and Cleaning are ticked).")
     if st.button("🎲 Generate sample", key="btn_sample"):
-        demands = []
-        for i in range(n_curves):
-            d = generate_sample_demand(
-                peak_agents=peaks[i],
-                base_agents=bases[i],
-                seed=sample_seed + i * 7,
-            )
-            demands.append(d)
-        st.session_state["demands"] = demands
-        st.session_state["occ_names"] = occ_names[:]
-        st.session_state["demand_source"] = "sample"
-        st.success(f"Generated {n_curves} sample curve(s)")
+        fl = generate_sample_flights(fpd, wb / 100, seed)
+        new, w2 = tasks_from_flights(fl, rules, circular)
+        for w in w2:
+            st.warning(w)
+        if new:
+            _set_tasks(new, "sample", fl)
+        else:
+            st.error("No tasks — tick at least one task rule.")
 
-# ── Preview demand chart ─────────────────────────────────────────────────────
-demands = st.session_state.get("demands")
-stored_names = st.session_state.get("occ_names", occ_names)
+# ── Task preview ─────────────────────────────────────────────────────────────
+if tasks:
+    src = st.session_state.get("task_source", "")
+    flights = st.session_state.get("flights")
+    st.success(f"Loaded {len(tasks):,} tasks ({src})")
+    st.subheader("Task preview")
+    tot_h = sum(t.duration * t.staff for t in tasks) / 60
+    flex = sum(1 for t in tasks if t.slack > 0)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Tasks", f"{len(tasks):,}")
+    m2.metric("Flights", f"{len(flights):,}" if flights else "—")
+    m3.metric("Task hours", f"{tot_h:,.0f}")
+    m4.metric("Occupations", len(occ_names))
+    m5.metric("With a time window", f"{100 * flex / len(tasks):.0f} %")
 
-if demands is not None:
-    # ensure curve count matches current n_curves
-    if len(demands) != n_curves:
-        st.warning("Number of curves changed — please regenerate / re-upload.")
-        demands = None
-
-if demands is not None:
-    st.subheader("Demand preview")
-    x_vals = list(range(TOTAL_INTERVALS))
-    fig_d = go.Figure()
-    for i, (d, name) in enumerate(zip(demands, stored_names)):
-        color = OCC_COLORS[i % len(OCC_COLORS)]
-        fig_d.add_trace(go.Scatter(
-            x=x_vals, y=d, mode="lines", name=name,
-            fill="tozeroy",
-            line=dict(color=color, width=1),
-            opacity=0.55,
-        ))
-    # add total if >1 curve
-    if len(demands) > 1:
-        total_d = sum(demands)
-        fig_d.add_trace(go.Scatter(
-            x=x_vals, y=total_d, mode="lines", name="Total",
-            line=dict(color="black", width=2, dash="dot"),
-        ))
-    # day separators
+    fig_p = go.Figure()
+    for i, name in enumerate(occ_names):
+        fig_p.add_trace(go.Scatter(
+            x=x5, y=earliest_load(tasks, name), mode="lines", name=name,
+            stackgroup="one", line=dict(width=0.5, color=OCC_COLORS[i % len(OCC_COLORS)])))
     for d in range(1, 7):
-        fig_d.add_vline(x=d * INTERVALS_PER_DAY, line_dash="dash",
-                        line_color="grey", opacity=0.4)
-    tick_vals = [d * INTERVALS_PER_DAY for d in range(7)]
-    fig_d.update_xaxes(tickvals=tick_vals, ticktext=DAY_NAMES)
-    fig_d.update_layout(height=300, margin=dict(l=40, r=20, t=30, b=30),
+        fig_p.add_vline(x=d * INTERVALS_PER_DAY, line_dash="dash", line_color="grey", opacity=0.4)
+    fig_p.update_xaxes(tickvals=[d * INTERVALS_PER_DAY for d in range(7)], ticktext=DAY_NAMES)
+    fig_p.update_layout(height=300, margin=dict(l=40, r=20, t=30, b=30),
                         legend=dict(orientation="h", y=1.12))
-    st.plotly_chart(fig_d, width="stretch")
+    st.caption("Staff needed if every task starts as early as it can (the optimiser "
+               "moves tasks inside their windows to smooth this).")
+    st.plotly_chart(fig_p, width="stretch")
 
+    with st.expander("📊 Tasks by occupation", expanded=True):
+        rows = []
+        for name in occ_names:
+            ts = [t for t in tasks if t.occupation == name]
+            rows.append({
+                "Occupation": name, "Tasks": len(ts),
+                "Task hours": round(sum(t.duration * t.staff for t in ts) / 60, 1),
+                "Avg duration (min)": round(np.mean([t.duration for t in ts]), 1),
+                "Peak staff (earliest starts)": int(earliest_load(tasks, name).max()),
+                "With a time window": sum(1 for t in ts if t.slack > 0),
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    with st.expander("🔎 Task list", expanded=False):
+        st.dataframe(tasks_to_dataframe(tasks), hide_index=True, width="stretch", height=300)
+        d1, d2 = st.columns(2)
+        d1.download_button("⬇ Task list (CSV)", task_list_csv(tasks), "tasks.csv", "text/csv")
+        if flights:
+            d2.download_button("⬇ Flights (CSV)", flights_csv(flights), "flights.csv", "text/csv")
 
-# ── Solve ────────────────────────────────────────────────────────────────────
-if demands is not None:
-    # ── Daily peak demand reference ──────────────────────────────────────
-    with st.expander("📊 Daily peak demand by occupation", expanded=True):
-        peak_rows = []
-        for i, (d, name) in enumerate(zip(demands, stored_names)):
-            for day in range(7):
-                s = day * INTERVALS_PER_DAY
-                e = s + INTERVALS_PER_DAY
-                peak_val = int(d[s:e].max())
-                peak_rows.append({
-                    "Occupation": name,
-                    "Day": DAY_NAMES[day],
-                    "Peak Demand": peak_val,
-                })
-        if peak_rows:
-            st.dataframe(pd.DataFrame(peak_rows),
-                         width="stretch", hide_index=True)
-
-    # Demand summary
-    total_demand_h = sum(d.sum() for d in demands) / INTERVALS_PER_HOUR
-    peak_total = int(sum(demands).max())
-    _sc1, _sc2 = st.columns(2)
-    _sc1.metric("Total demand (worker-hours)", f"{total_demand_h:,.0f}")
-    _sc2.metric("Peak simultaneous demand", peak_total)
-
-    # Input validation
-    _warnings: list[str] = []
     if min_shift > max_shift:
-        _warnings.append("Min shift hours > Max shift hours")
-    for w in _warnings:
-        st.warning(w)
+        st.warning("Min shift hours > Max shift hours")
 
     if st.button("▶ Run Optimiser", type="primary"):
         log_box = st.empty()
-        log_lines: list[str] = []
+        log_lines: list = []
 
         def _cb(msg):
             log_lines.append(msg)
@@ -570,472 +429,267 @@ if demands is not None:
 
         with st.spinner("Solving …"):
             try:
-                result = solve_multi(demands, stored_names, params, callback=_cb)
+                res = solve_tasks(tasks, params, callback=_cb)
             except MemoryError:
-                st.error("Out of memory — try reducing the number of occupations or shortening the time limit.")
+                st.error("Out of memory — try fewer start times per task or a shorter week.")
                 st.stop()
             except Exception as exc:
                 st.error(f"Solver crashed: {exc}")
                 st.stop()
-
-        # stash previous before overwriting
         if "result" in st.session_state:
             st.session_state["prev_result"] = st.session_state["result"]
             st.session_state["prev_result_params"] = st.session_state.get("result_params")
-        st.session_state["result"] = result
+        st.session_state["result"] = res
         st.session_state["result_params"] = params
 
 
 # ── Results ──────────────────────────────────────────────────────────────────
-result: MultiCurveResult | None = st.session_state.get("result")
+res: TaskResult = st.session_state.get("result")
 
-if result is not None:
+if res is not None and tasks:
     st.divider()
-
+    st.header("📊 Results")
+    result = res.multi
     cp1 = result.combined_phase1
     n_occ = len(result.occupations)
 
-    # ── Infeasibility guard ──────────────────────────────────────────────
-    _feasible = cp1.status in ("OPTIMAL", "FEASIBLE")
-    if not _feasible:
-        st.header("📊 Results")
+    if cp1.status not in ("OPTIMAL", "FEASIBLE"):
         st.error(
-            f"**Solver status: {cp1.status}**  (solved in {cp1.elapsed_sec:.1f}s)\n\n"
-            "The model has no feasible solution with the current settings. "
-            "Try relaxing one or more constraints:\n"
-            "- Widen the shift-duration range (lower min / raise max)\n"
-            "- Remove or loosen entry / exit / headcount limits\n"
-            "- Uncheck *Exclude night shifts* if demand peaks at night\n"
-            "- Increase the solver time limit (the solver may need more time)"
-        )
+            f"**Solver status: {cp1.status}**  ({cp1.elapsed_sec:.1f}s)\n\n"
+            "No shift plan was found with the current settings. Try:\n"
+            "- a wider shift-duration range (lower min / raise max)\n"
+            "- fewer entry / exit / headcount limits\n"
+            "- unticking *Exclude night shifts* if tasks run at night\n"
+            "- a longer time limit")
         st.stop()
 
-    st.header("📊 Results")
-
-    # ── Phase 1 summary metrics ──────────────────────────────────────────
-    st.subheader("Phase 1 – Set Covering")
-    total_headcount = max_headcount(cp1)
-    peak_sim = int(cp1.coverage.max())
+    st.subheader("Shift plan")
     total_wh = cp1.total_worker_intervals / INTERVALS_PER_HOUR
     n_active = sum(1 for c in cp1.counts if c > 0)
-
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Status", cp1.status)
     c2.metric("Active shifts", n_active)
-    c3.metric("Total worker-h", f"{total_wh:,.0f}")
-    c4.metric("Headcount", total_headcount)
-    c5.metric("Peak Simultaneous", peak_sim)
+    c3.metric("Paid hours", f"{total_wh:,.0f}")
+    c4.metric("Headcount", max_headcount(cp1), help="Most workers starting a shift on one day.")
+    c5.metric("Peak on duty", int(cp1.coverage.max()))
     c6.metric("FTE (÷45)", f"{total_wh / 45:.1f}")
     c7.metric("Solve time", f"{cp1.elapsed_sec:.1f}s")
 
-    # ── Coverage quality ─────────────────────────────────────────────────
-    _combined_dem = result.combined_demand
-    _deficit = np.maximum(_combined_dem - cp1.coverage, 0)
-    _deficit_intervals = int(np.count_nonzero(_deficit))
-    _total_intervals_with_demand = int(np.count_nonzero(_combined_dem))
-    _pct_covered = (
-        100.0 * (1 - _deficit_intervals / _total_intervals_with_demand)
-        if _total_intervals_with_demand > 0 else 100.0
-    )
-    _gap_wh = float(_deficit.sum()) / INTERVALS_PER_HOUR
-    _max_deficit = int(_deficit.max()) if _deficit_intervals > 0 else 0
-    _surplus = np.maximum(cp1.coverage - _combined_dem, 0)
-    _surplus_wh = float(_surplus.sum()) / INTERVALS_PER_HOUR
+    staffed = len(res.tasks) - len(res.unassigned)
+    util = utilisation(res)
+    q1, q2, q3, q4, q5 = st.columns(5)
+    q1.metric("Tasks staffed", f"{staffed:,} / {len(res.tasks):,}")
+    q2.metric("Task hours", f"{task_hours(res):,.0f}")
+    q3.metric("Utilisation", f"{util:.1f} %", help="Task hours ÷ paid hours.")
+    q4.metric("Workers", len(res.workers))
+    q5.metric("Repairs", f"{res.extended_shifts} + {res.extra_workers}",
+              help="Shifts lengthened + workers added by the assignment check.")
 
-    cq1, cq2, cq3, cq4 = st.columns(4)
-    cq1.metric("Coverage", f"{_pct_covered:.1f} %")
-    cq2.metric("Under-coverage", f"{_gap_wh:,.1f} wh")
-    cq3.metric("Max deficit", _max_deficit)
-    cq4.metric("Over-coverage", f"{_surplus_wh:,.1f} wh")
-
-    # ── Operational buffer check (prep / exit / handover) ───────────────
     _rp = result.params
-    if result.combined_required is not None:
-        _bv = buffer_violations(result)
-        if _bv["intervals"] == 0:
-            st.success(
-                f"✅ Operational buffers respected — prep {_rp.prep_lead_min} min "
-                f"before ramp-ups, stay {_rp.exit_lag_min} min after ramp-downs, "
-                f"{_rp.handover_overlap_min} min handover overlap.")
-        else:
-            st.warning(
-                f"Operational buffers not fully met: {_bv['intervals']} intervals "
-                f"({_bv['short_wh']:.1f} worker-hours short of prep/exit/handover "
-                f"requirement).")
-
-    if _deficit_intervals > 0:
-        st.warning(
-            f"Demand is not fully covered: **{_deficit_intervals}** intervals "
-            f"({_gap_wh:.1f} worker-hours) remain below demand. "
-            f"Peak deficit: **{_max_deficit}** workers."
-        )
+    if not res.unassigned:
+        st.success("✅ Every task is staffed: each one is done whole by one worker, with "
+                   f"{_rp.travel_min} min travel between stands, {_rp.briefing_min} min "
+                   f"briefing, {_rp.closeout_min} min close-out"
+                   + (" and breaks planned." if _rp.breaks else "."))
+    else:
+        tmap = {t.tid: t for t in res.tasks}
+        st.warning(f"{len(res.unassigned)} task(s) could not be staffed — no allowed shift "
+                   "can hold them (e.g. at the very end of a non-circular week): "
+                   + ", ".join(f"{tmap[i].name} {tmap[i].flight}" for i in res.unassigned[:10]))
+    if res.extended_shifts or res.extra_workers:
+        st.info(f"The assignment check lengthened **{res.extended_shifts}** shift(s) and added "
+                f"**{res.extra_workers}** worker(s) so that every task fits whole in one shift. "
+                "These changes are not re-checked against entry/exit or headcount limits.")
 
     # ── What changed vs previous solve ──────────────────────────────────
-    _prev_result: MultiCurveResult | None = st.session_state.get("prev_result")
-    _prev_params: SolverParams | None = st.session_state.get("prev_result_params")
-    _cur_params: SolverParams | None = st.session_state.get("result_params")
-    if (_prev_result is not None
-            and _prev_result.combined_phase1.status in ("OPTIMAL", "FEASIBLE")):
-        with st.expander("🔄 What changed vs previous solve", expanded=True):
-            _pcp1 = _prev_result.combined_phase1
-
-            # --- param diff ---
-            _param_rows = []
-            if _prev_params is not None and _cur_params is not None:
-                for _f in dataclasses.fields(SolverParams):
-                    _ov = getattr(_prev_params, _f.name)
-                    _nv = getattr(_cur_params, _f.name)
-                    if _ov != _nv:
-                        _param_rows.append({"Parameter": _f.name,
-                                            "Previous": _ov, "Now": _nv})
-            if _param_rows:
-                st.caption("**Settings changed:**")
-                st.dataframe(pd.DataFrame(_param_rows),
-                             width="stretch", hide_index=True)
+    prev: TaskResult = st.session_state.get("prev_result")
+    if prev is not None and prev.status in ("OPTIMAL", "FEASIBLE"):
+        with st.expander("🔄 What changed vs previous solve", expanded=False):
+            pp, cp = st.session_state.get("prev_result_params"), st.session_state.get("result_params")
+            rows = []
+            if pp is not None and cp is not None:
+                for f in dataclasses.fields(TaskParams):
+                    if getattr(pp, f.name) != getattr(cp, f.name):
+                        rows.append({"Parameter": f.name, "Previous": str(getattr(pp, f.name)),
+                                     "Now": str(getattr(cp, f.name))})
+            if rows:
+                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
             else:
                 st.caption("Settings unchanged.")
+            pc = prev.multi.combined_phase1
+            pwh = pc.total_worker_intervals / INTERVALS_PER_HOUR
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("Paid hours", f"{total_wh:,.0f}", f"{total_wh - pwh:+,.0f}", delta_color="inverse")
+            d2.metric("Active shifts", n_active, n_active - sum(1 for c in pc.counts if c > 0))
+            d3.metric("Utilisation", f"{util:.1f} %", f"{util - utilisation(prev):+.1f} %")
+            d4.metric("Workers", len(res.workers), len(res.workers) - len(prev.workers),
+                      delta_color="inverse")
 
-            # --- metric deltas ---
-            _prev_wh = _pcp1.total_worker_intervals / INTERVALS_PER_HOUR
-            _prev_active = sum(1 for c in _pcp1.counts if c > 0)
-            _prev_hc = max_headcount(_pcp1)
-            _prev_peak_sim = int(_pcp1.coverage.max())
-            _prev_deficit_arr = np.maximum(
-                _prev_result.combined_demand - _pcp1.coverage, 0)
-            _prev_gap_wh = float(_prev_deficit_arr.sum()) / INTERVALS_PER_HOUR
-            _prev_di = int(np.count_nonzero(_prev_deficit_arr))
-            _prev_tid = int(np.count_nonzero(_prev_result.combined_demand))
-            _prev_pct = (100.0 * (1 - _prev_di / _prev_tid)
-                         if _prev_tid > 0 else 100.0)
+    # ── Limits check (entry-based headcount) ────────────────────────────
+    limit_rows = []
+    if _rp.max_headcount_per_day or _rp.min_headcount_per_day:
+        daily = daily_entry_headcount(cp1)
+        for d in range(7):
+            mx = (_rp.max_headcount_per_day or [0] * 7)[d]
+            mn = (_rp.min_headcount_per_day or [0] * 7)[d]
+            if mx or mn:
+                ok = (not mx or daily[d] <= mx) and (not mn or daily[d] >= mn)
+                limit_rows.append({"Scope": "All", "Day": DAY_NAMES[d], "Workers": daily[d],
+                                   "Max": mx or "—", "Min": mn or "—",
+                                   "Status": "✅" if ok else "❌"})
+    for i, occ in enumerate(result.occupations):
+        mxl = (_rp.occ_max_headcount_per_day or [None] * n_occ)[i] if _rp.occ_max_headcount_per_day else None
+        mnl = (_rp.occ_min_headcount_per_day or [None] * n_occ)[i] if _rp.occ_min_headcount_per_day else None
+        if not (mxl or mnl):
+            continue
+        daily = daily_entry_headcount(occ.phase1)
+        for d in range(7):
+            mx = mxl[d] if mxl else 0
+            mn = mnl[d] if mnl else 0
+            if mx or mn:
+                ok = (not mx or daily[d] <= mx) and (not mn or daily[d] >= mn)
+                limit_rows.append({"Scope": occ.name, "Day": DAY_NAMES[d], "Workers": daily[d],
+                                   "Max": mx or "—", "Min": mn or "—",
+                                   "Status": "✅" if ok else "❌"})
+    if limit_rows:
+        with st.expander("👥 Headcount vs limits", expanded=False):
+            st.dataframe(pd.DataFrame(limit_rows), hide_index=True, width="stretch")
 
-            st.caption("**Metrics:**")
-            _dc1, _dc2, _dc3, _dc4, _dc5 = st.columns(5)
-            _dc1.metric("Active shifts", n_active,
-                        delta=n_active - _prev_active)
-            _dc2.metric("Worker-hours", f"{total_wh:,.0f}",
-                        delta=f"{total_wh - _prev_wh:+,.0f}")
-            _dc3.metric("Headcount", total_headcount,
-                        delta=total_headcount - _prev_hc,
-                        delta_color="inverse")
-            _dc4.metric("Coverage", f"{_pct_covered:.1f} %",
-                        delta=f"{_pct_covered - _prev_pct:+.1f} %")
-            _dc5.metric("Under-cov (wh)", f"{_gap_wh:.1f}",
-                        delta=f"{_gap_wh - _prev_gap_wh:+.1f}",
-                        delta_color="inverse")
-
-            # --- shifts added / removed ---
-            _prev_codes: set[str] = set()
-            for _occ in _prev_result.occupations:
-                for _s, _cnt in zip(_occ.phase1.shifts, _occ.phase1.counts):
-                    if _cnt > 0:
-                        _prev_codes.add(_s.shift_code)
-            _cur_codes: set[str] = set()
-            for _occ in result.occupations:
-                for _s, _cnt in zip(_occ.phase1.shifts, _occ.phase1.counts):
-                    if _cnt > 0:
-                        _cur_codes.add(_s.shift_code)
-            _added = sorted(_cur_codes - _prev_codes)
-            _removed = sorted(_prev_codes - _cur_codes)
-            if _added or _removed:
-                _ch1, _ch2 = st.columns(2)
-                if _added:
-                    _ch1.caption(f"**Shifts added ({len(_added)}):**")
-                    _ch1.write(", ".join(_added))
-                if _removed:
-                    _ch2.caption(f"**Shifts removed ({len(_removed)}):**")
-                    _ch2.write(", ".join(_removed))
-            else:
-                st.caption("No shift types added or removed.")
-
-    # per-occupation headcount metrics
-    if n_occ > 1:
-        occ_cols = st.columns(n_occ)
-        for i, occ in enumerate(result.occupations):
-            with occ_cols[i]:
-                occ_wh = occ.phase1.total_worker_intervals / INTERVALS_PER_HOUR
-                occ_hc = max_headcount(occ.phase1)
-                st.metric(f"{occ.name} headcount", occ_hc)
-                st.metric(f"{occ.name} worker-h", f"{occ_wh:,.0f}")
-
-    # combined daily headcount vs minimum table (entry-based)
-    if _rp.min_headcount_per_day:
-        with st.expander("👥 Combined daily headcount vs minimum", expanded=False):
-            rows = []
-            daily_entries = daily_entry_headcount(cp1)
-            for day in range(7):
-                min_req = _rp.min_headcount_per_day[day]
-                if min_req <= 0:
-                    continue
-                actual = daily_entries[day]
-                rows.append({
-                    "Day": DAY_NAMES[day],
-                    "Workers entering shifts": actual,
-                    "Required Min": min_req,
-                    "Status": "✅" if actual >= min_req else "❌ VIOLATION",
-                })
-            if rows:
-                st.dataframe(pd.DataFrame(rows),
-                             width="stretch", hide_index=True)
-            else:
-                st.caption("No combined minimum headcount requirements were set.")
-
-    # per-occupation daily headcount vs limit table (entry-based)
-    if _rp.occ_max_headcount_per_day:
-        with st.expander("👤 Per-occupation daily headcount vs limit", expanded=False):
-            rows = []
-            for i, occ in enumerate(result.occupations):
-                occ_limits = _rp.occ_max_headcount_per_day[i]
-                if occ_limits is None:
-                    continue
-                daily = daily_entry_headcount(occ.phase1)
-                for day in range(7):
-                    limit = occ_limits[day]
-                    if limit <= 0:
-                        continue
-                    actual = daily[day]
-                    rows.append({
-                        "Occupation": occ.name,
-                        "Day": DAY_NAMES[day],
-                        "Workers entering shifts": actual,
-                        "Limit": limit,
-                        "Status": "✅" if actual <= limit else "❌ VIOLATION",
-                    })
-            if rows:
-                st.dataframe(pd.DataFrame(rows),
-                             width="stretch", hide_index=True)
-            else:
-                st.caption("No per-occupation headcount limits were set.")
-
-    # per-occupation shift-code headcount table
-    if _rp.occ_headcount_per_shift_code:
-        with st.expander("🕐 Shift-type headcount vs limits", expanded=False):
-            rows = []
-            for i, occ in enumerate(result.occupations):
-                sc_limits = _rp.occ_headcount_per_shift_code[i]
-                if sc_limits is None:
-                    continue
-                for code, spec in sc_limits.items():
-                    if isinstance(spec, list):
-                        max_limits = spec
-                        min_limits = None
-                    else:
-                        max_limits = spec.get("max")
-                        min_limits = spec.get("min")
-                    # Compute actual workers per shift-code per day
-                    daily_workers = [0] * 7
-                    for s, cnt in zip(occ.phase1.shifts, occ.phase1.counts):
-                        if s.shift_code == code and cnt > 0:
-                            daily_workers[s.day] += cnt
-                    for day in range(7):
-                        actual = daily_workers[day]
-                        max_l = max_limits[day] if max_limits else 0
-                        min_l = min_limits[day] if min_limits else 0
-                        if max_l > 0 or min_l > 0:
-                            status = "✅"
-                            if max_l > 0 and actual > max_l:
-                                status = "❌ VIOLATION (max)"
-                            if min_l > 0 and actual < min_l:
-                                status = "❌ VIOLATION (min)"
-                            rows.append({
-                                "Occupation": occ.name,
-                                "Shift Code": code,
-                                "Day": DAY_NAMES[day],
-                                "Workers": actual,
-                                "Max Limit": max_l if max_l > 0 else "—",
-                                "Min Limit": min_l if min_l > 0 else "—",
-                                "Status": status,
-                            })
-            if rows:
-                st.dataframe(pd.DataFrame(rows),
-                             width="stretch", hide_index=True)
-            else:
-                st.caption("No shift-type headcount constraints were active.")
-
-    # per-occupation daily headcount vs minimum table (entry-based)
-    if _rp.occ_min_headcount_per_day:
-        with st.expander("👤 Per-occupation daily headcount vs minimum", expanded=False):
-            rows = []
-            for i, occ in enumerate(result.occupations):
-                occ_mins = _rp.occ_min_headcount_per_day[i]
-                if occ_mins is None:
-                    continue
-                daily = daily_entry_headcount(occ.phase1)
-                for day in range(7):
-                    min_req = occ_mins[day]
-                    if min_req <= 0:
-                        continue
-                    actual = daily[day]
-                    rows.append({
-                        "Occupation": occ.name,
-                        "Day": DAY_NAMES[day],
-                        "Workers entering shifts": actual,
-                        "Required Min": min_req,
-                        "Status": "✅" if actual >= min_req else "❌ VIOLATION",
-                    })
-            if rows:
-                st.dataframe(pd.DataFrame(rows),
-                             width="stretch", hide_index=True)
-            else:
-                st.caption("No per-occupation minimum headcount requirements were set.")
-
-    # ── Weekly coverage chart (combined + sub-curves) ────────────────────
+    # ── Weekly coverage ─────────────────────────────────────────────────
     st.subheader("Weekly coverage")
-    x_vals = list(range(TOTAL_INTERVALS))
+    prod_total = sum(res.productive.values())
     fig_w = go.Figure()
-
-    # total demand + coverage (thick lines)
-    fig_w.add_trace(go.Scatter(
-        x=x_vals, y=result.combined_demand, mode="lines",
-        name="Total demand",
-        line=dict(color="red", width=2),
-        fill="tozeroy", fillcolor="rgba(255,0,0,0.08)",
-    ))
-    if result.combined_required is not None:
-        fig_w.add_trace(go.Scatter(
-            x=x_vals, y=result.combined_required, mode="lines",
-            name="Required incl. prep/exit",
-            line=dict(color="orange", width=1.5, dash="dot"),
-        ))
-    fig_w.add_trace(go.Scatter(
-        x=x_vals, y=cp1.coverage, mode="lines",
-        name="Total coverage",
-        line=dict(color="green", width=2),
-        fill="tozeroy", fillcolor="rgba(0,128,0,0.08)",
-    ))
-
-    # per-occupation sub-curves (thin, dashed)
+    fig_w.add_trace(go.Scatter(x=x5, y=result.combined_demand, mode="lines", name="Task load",
+                               line=dict(color="red", width=2),
+                               fill="tozeroy", fillcolor="rgba(255,0,0,0.08)"))
+    fig_w.add_trace(go.Scatter(x=x5, y=prod_total, mode="lines", name="Available for tasks",
+                               line=dict(color="green", width=2),
+                               fill="tozeroy", fillcolor="rgba(0,128,0,0.08)"))
+    fig_w.add_trace(go.Scatter(x=x5, y=cp1.coverage, mode="lines", name="On shift",
+                               line=dict(color="grey", width=1, dash="dot")))
     if n_occ > 1:
         for i, occ in enumerate(result.occupations):
             clr = OCC_COLORS[i % len(OCC_COLORS)]
-            fig_w.add_trace(go.Scatter(
-                x=x_vals, y=occ.demand, mode="lines",
-                name=f"{occ.name} demand",
-                line=dict(color=clr, width=1, dash="dash"),
-                visible="legendonly",
-            ))
-            fig_w.add_trace(go.Scatter(
-                x=x_vals, y=occ.phase1.coverage, mode="lines",
-                name=f"{occ.name} coverage",
-                line=dict(color=clr, width=1),
-                visible="legendonly",
-            ))
-
+            fig_w.add_trace(go.Scatter(x=x5, y=occ.demand, mode="lines", name=f"{occ.name} load",
+                                       line=dict(color=clr, width=1, dash="dash"),
+                                       visible="legendonly"))
+            fig_w.add_trace(go.Scatter(x=x5, y=res.productive[occ.name], mode="lines",
+                                       name=f"{occ.name} available", line=dict(color=clr, width=1),
+                                       visible="legendonly"))
     for d in range(1, 7):
-        fig_w.add_vline(x=d * INTERVALS_PER_DAY, line_dash="dash",
-                        line_color="grey", opacity=0.4)
-    tick_vals = [d * INTERVALS_PER_DAY for d in range(7)]
-    fig_w.update_xaxes(tickvals=tick_vals, ticktext=DAY_NAMES)
+        fig_w.add_vline(x=d * INTERVALS_PER_DAY, line_dash="dash", line_color="grey", opacity=0.4)
+    fig_w.update_xaxes(tickvals=[d * INTERVALS_PER_DAY for d in range(7)], ticktext=DAY_NAMES)
     fig_w.update_layout(height=400, margin=dict(l=40, r=20, t=30, b=30),
                         legend=dict(orientation="h", y=1.15))
     st.plotly_chart(fig_w, width="stretch")
+    st.caption("Task load includes the walk to the stand. *Available for tasks* is staff on "
+               "shift minus briefing, close-out and breaks.")
 
-    # ── Daily coverage chart (dropdown) ──────────────────────────────────
-    st.subheader("Daily coverage")
-    sel_day = st.selectbox("Day", DAY_NAMES, key="sel_day")
-    day_idx = DAY_NAMES.index(sel_day)
-    day_start = day_idx * INTERVALS_PER_DAY
-    day_end = day_start + INTERVALS_PER_DAY
-    day_x = list(range(INTERVALS_PER_DAY))
+    # ── Daily view: coverage + worker plan ──────────────────────────────
+    st.subheader("Daily plan")
+    dc1, dc2 = st.columns([1, 1])
+    sel_day = dc1.selectbox("Day", DAY_NAMES, key="sel_day")
+    sel_occ = dc2.selectbox("Occupation", [o.name for o in result.occupations], key="sel_occ")
+    di = DAY_NAMES.index(sel_day)
+    ds, de = di * INTERVALS_PER_DAY, (di + 1) * INTERVALS_PER_DAY
+    oi = [o.name for o in result.occupations].index(sel_occ)
+    occ = result.occupations[oi]
+    hx = [k / INTERVALS_PER_HOUR for k in range(INTERVALS_PER_DAY)]
 
-    # per-occupation day metrics
-    if n_occ > 1:
-        day_met_cols = st.columns(n_occ + 1)
-        for i, occ in enumerate(result.occupations):
-            sl = slice(day_start, day_end)
-            with day_met_cols[i]:
-                d_dem = occ.demand[sl]
-                d_cov = occ.phase1.coverage[sl]
-                st.metric(f"{occ.name} peak demand", int(d_dem.max()))
-                st.metric(f"{occ.name} peak coverage", int(d_cov.max()))
-        with day_met_cols[-1]:
-            td = result.combined_demand[day_start:day_end]
-            tc = cp1.coverage[day_start:day_end]
-            st.metric("Total peak demand", int(td.max()))
-            st.metric("Total peak coverage", int(tc.max()))
+    dm1, dm2, dm3, dm4 = st.columns(4)
+    d_load = occ.demand[ds:de]
+    d_prod = res.productive[sel_occ][ds:de]
+    day_workers = [w for w in res.workers if w.occupation == sel_occ and w.shift.day == di]
+    day_tasks = [t for t in res.tasks if t.occupation == sel_occ and t.tid in res.start
+                 and res.start[t.tid] // 1440 == di]
+    dm1.metric("Peak task load", int(d_load.max()))
+    dm2.metric("Peak available", int(d_prod.max()))
+    dm3.metric("Workers starting", len(day_workers))
+    dm4.metric("Tasks", len(day_tasks))
+
+    fig_d = go.Figure()
+    fig_d.add_trace(go.Scatter(x=hx, y=d_load, mode="lines", name="Task load",
+                               line=dict(color="red", width=2),
+                               fill="tozeroy", fillcolor="rgba(255,0,0,0.08)"))
+    fig_d.add_trace(go.Scatter(x=hx, y=d_prod, mode="lines", name="Available for tasks",
+                               line=dict(color="green", width=2, shape="hv"),
+                               fill="tozeroy", fillcolor="rgba(0,128,0,0.08)"))
+    fig_d.add_trace(go.Scatter(x=hx, y=occ.phase1.coverage[ds:de], mode="lines",
+                               name="On shift", line=dict(color="grey", width=1, dash="dot",
+                                                          shape="hv")))
+    fig_d.update_xaxes(tickvals=list(range(0, 25, 1)), ticktext=[f"{h:02d}:00" for h in range(25)],
+                       tickangle=45, range=[0, 24])
+    fig_d.update_layout(height=320, margin=dict(l=40, r=20, t=30, b=50),
+                        legend=dict(orientation="h", y=1.15))
+    st.plotly_chart(fig_d, width="stretch")
+
+    # Gantt: one row per worker starting that day
+    if day_workers:
+        tmap = {t.tid: t for t in res.tasks}
+        names = sorted({tmap[i].name for w in day_workers for i in w.tasks})
+        colour = {n: OCC_COLORS[(k + 1) % len(OCC_COLORS)] for k, n in enumerate(names)}
+        day_workers.sort(key=lambda w: (w.shift.global_start, w.shift.global_end, w.wid))
+        rows_y = [f"{w.wid} · {w.code}" for w in day_workers]
+        fig_g = go.Figure()
+        to_h = (lambda k: (k - ds) / INTERVALS_PER_HOUR)
+        fig_g.add_trace(go.Bar(
+            y=rows_y, x=[w.shift.duration_intervals / INTERVALS_PER_HOUR for w in day_workers],
+            base=[to_h(w.shift.global_start) for w in day_workers], orientation="h",
+            marker=dict(color="rgba(150,160,175,0.25)",
+                        line=dict(color="rgba(120,130,145,0.6)", width=1)),
+            name="Shift", hovertemplate="%{y}<extra>shift</extra>"))
+        bw = [w for w in day_workers if w.break_end > w.break_start]
+        if bw:
+            fig_g.add_trace(go.Bar(
+                y=[rows_y[day_workers.index(w)] for w in bw],
+                x=[(w.break_end - w.break_start) / INTERVALS_PER_HOUR for w in bw],
+                base=[to_h(w.break_start) for w in bw], orientation="h",
+                marker=dict(color="rgba(90,90,90,0.55)"), name="Break",
+                hovertemplate="break<extra></extra>"))
+        for n in names:
+            ys, xs, bs, tx = [], [], [], []
+            for w, ylab in zip(day_workers, rows_y):
+                for i in w.tasks:
+                    t = tmap[i]
+                    if t.name != n:
+                        continue
+                    s0 = res.start[i] / 5
+                    ys.append(ylab)
+                    xs.append(t.duration / 60)
+                    bs.append(to_h(s0))
+                    tx.append(f"{t.name} {t.flight} {t.location}".strip())
+            fig_g.add_trace(go.Bar(y=ys, x=xs, base=bs, orientation="h", name=n,
+                                   marker=dict(color=colour[n]), text=tx,
+                                   hovertemplate="%{text}<extra></extra>",
+                                   textposition="none"))
+        fig_g.update_layout(barmode="overlay", height=max(260, 22 * len(day_workers) + 90),
+                            margin=dict(l=10, r=20, t=10, b=40),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.0,
+                                        xanchor="left", x=0))
+        fig_g.update_yaxes(autorange="reversed", tickfont=dict(size=10))
+        fig_g.update_xaxes(tickvals=list(range(0, 37, 1)),
+                           ticktext=[f"{h % 24:02d}:00" for h in range(37)],
+                           range=[max(0, min(b for b in [to_h(w.shift.global_start) for w in day_workers]) - 0.5),
+                                  max(to_h(w.shift.global_end) for w in day_workers) + 0.5])
+        st.markdown(f"**Worker plan – {sel_occ}, {sel_day}** (shifts starting that day)")
+        st.plotly_chart(fig_g, width="stretch")
     else:
-        occ = result.occupations[0]
-        sl = slice(day_start, day_end)
-        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-        d_dem = occ.demand[sl]
-        d_cov = occ.phase1.coverage[sl]
-        mc1.metric("Peak demand", int(d_dem.max()))
-        mc2.metric("Peak coverage", int(d_cov.max()))
-        mc3.metric("Avg demand", f"{d_dem.mean():.1f}")
-        mc4.metric("Avg coverage", f"{d_cov.mean():.1f}")
-        surplus = d_cov.astype(int) - d_dem.astype(int)
-        mc5.metric("Max surplus", int(surplus.max()))
+        st.caption("No shifts start on this day for this occupation.")
 
-    fig_day = go.Figure()
-    # total
-    td = result.combined_demand[day_start:day_end]
-    tc = cp1.coverage[day_start:day_end]
-    fig_day.add_trace(go.Scatter(
-        x=day_x, y=td, mode="lines", name="Total demand",
-        line=dict(color="red", width=2),
-        fill="tozeroy", fillcolor="rgba(255,0,0,0.08)",
-    ))
-    if result.combined_required is not None:
-        fig_day.add_trace(go.Scatter(
-            x=day_x, y=result.combined_required[day_start:day_end],
-            mode="lines", name="Required incl. prep/exit",
-            line=dict(color="orange", width=1.5, dash="dot"),
-        ))
-    fig_day.add_trace(go.Scatter(
-        x=day_x, y=tc, mode="lines", name="Total coverage",
-        line=dict(color="green", width=2),
-        fill="tozeroy", fillcolor="rgba(0,128,0,0.08)",
-    ))
-    # shade deficit (demand > coverage)
-    _day_deficit = np.maximum(td - tc, 0)
-    if _day_deficit.any():
-        fig_day.add_trace(go.Scatter(
-            x=day_x, y=td, mode="lines", name="Deficit",
-            line=dict(width=0), showlegend=True,
-        ))
-        fig_day.add_trace(go.Scatter(
-            x=day_x, y=tc, mode="lines", name="_deficit_fill",
-            line=dict(width=0), showlegend=False,
-            fill="tonexty", fillcolor="rgba(255,0,0,0.25)",
-        ))
-    if n_occ > 1:
-        for i, occ in enumerate(result.occupations):
-            clr = OCC_COLORS[i % len(OCC_COLORS)]
-            fig_day.add_trace(go.Scatter(
-                x=day_x, y=occ.demand[day_start:day_end],
-                mode="lines", name=f"{occ.name} demand",
-                line=dict(color=clr, width=1, dash="dash"),
-            ))
-            fig_day.add_trace(go.Scatter(
-                x=day_x, y=occ.phase1.coverage[day_start:day_end],
-                mode="lines", name=f"{occ.name} coverage",
-                line=dict(color=clr, width=1),
-                fill="tozeroy", fillcolor=f"rgba({int(clr[1:3],16)},{int(clr[3:5],16)},{int(clr[5:7],16)},0.10)",
-            ))
-
-    hourly_ticks = list(range(0, INTERVALS_PER_DAY, INTERVALS_PER_HOUR))
-    hourly_labels = [f"{h:02d}:00" for h in range(24)]
-    fig_day.update_xaxes(tickvals=hourly_ticks, ticktext=hourly_labels,
-                         tickangle=45)
-    fig_day.update_layout(height=400, margin=dict(l=40, r=20, t=30, b=50),
-                          legend=dict(orientation="h", y=1.12))
-    st.plotly_chart(fig_day, width="stretch")
-
-    # ── Shift Types ──────────────────────────────────────────────────────
+    # ── Tables ───────────────────────────────────────────────────────────
     st.subheader("Shift types")
-    all_st = []
-    for occ in result.occupations:
-        st_df = shift_type_summary(occ.phase1, occ.name)
-        all_st.append(st_df)
-    if all_st:
-        combined_st = pd.concat(all_st, ignore_index=True)
-        st.dataframe(combined_st, width="stretch", hide_index=True)
+    st.dataframe(shift_types(res), width="stretch", hide_index=True)
 
-    # ── XLSX download ────────────────────────────────────────────────────
+    with st.expander("🧾 Task assignment", expanded=False):
+        adf = assignment_dataframe(res)
+        st.dataframe(adf, width="stretch", hide_index=True, height=350)
+    with st.expander("👷 Workers", expanded=False):
+        st.dataframe(workers_dataframe(res), width="stretch", hide_index=True, height=350)
+    with st.expander("🪵 Solver log", expanded=False):
+        st.code("\n".join(res.log), language="text")
+
     st.subheader("📥 Download report")
-    xlsx_bytes = build_weekly_report_xlsx(result)
     st.download_button(
-        "⬇ Download XLSX report",
-        data=xlsx_bytes,
-        file_name="simplex_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        "⬇ Download XLSX report", data=build_task_report_xlsx(res),
+        file_name="simplex_tasks_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
