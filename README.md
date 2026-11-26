@@ -9,7 +9,7 @@ curve, the way task-based demand works in GroundStar / Plan Control.
 | Input | Workload curve (5-min staff need) | Tasks with a time window, duration, staff, qualification |
 | Decides | Shift counts | Shift counts **and** each task's start time |
 | Checks | Curve covered every 5 min | Every task done whole by one worker, with travel time, briefing, close-out and breaks |
-| Output | Shift types, coverage, ERP Shifttype | Same, plus task assignment and a worker Gantt |
+| Output | Shift types, coverage, ERP Shifttype | Same, plus task assignment, a worker Gantt and a GroundStar Plan Control shift plan (.sfp) |
 
 ## Input
 
@@ -49,6 +49,17 @@ start/end times, night-shift exclusion, circular week, force include/exclude,
 max unique shift types, entry/exit limits, headcount limits (combined, per
 occupation, per shift code) and the transition penalty.
 
+## GroundStar shift plan export (.sfp)
+
+After a run, upload any Plan Control shift plan (.sfp) of the same resource
+type as a template and download the plan as `<RESOURCE>_SIMPLEX_SHIFTS.sfp`.
+The template's settings (everything before the shift list) are kept; the shift
+list is replaced by one shift per worker per day with its qualification, shift
+code, times and valid weekdays, plus the day task Plan Control uses to place a
+shift on its day (day 1 = Monday). Flight tasks are not written – Plan Control
+assigns them again. Before use, every shift and day task of the template is
+rebuilt byte for byte to make sure the file version matches.
+
 ## Run
 
 ```bash
@@ -67,6 +78,7 @@ part of the `ortools` wheel.
 | `app.py` | Streamlit front-end (task-based) |
 | `tasks.py` | Tasks, flights, task rules, imports, sample schedule |
 | `groundstar_rules.py` | INFORM flight export + GroundStar engage-rule export → tasks |
+| `sfp_export.py` | Plan Control shift plan (.sfp) writer |
 | `task_solver.py` | Model, assignment check, repair, reports |
 | `solver.py` | Shared shift machinery from the curve-based Simplex |
-| `test_task_solver.py`, `test_groundstar_rules.py` | Tests for the task-based parts |
+| `test_task_solver.py`, `test_groundstar_rules.py`, `test_sfp_export.py` | Tests for the task-based parts |

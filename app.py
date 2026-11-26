@@ -30,6 +30,7 @@ from groundstar_rules import (
     read_engage_rules, rules_summary, referenced_groups, default_actype_groups,
     parse_flight_number_groups, default_fn_text, engage_tasks,
 )
+from sfp_export import read_template, shift_records, build_sfp
 from task_solver import (
     TaskParams, TaskResult, solve_tasks, utilisation, task_hours,
     assignment_dataframe, workers_dataframe, build_task_report_xlsx,
@@ -280,6 +281,11 @@ def _read_flights_cached(name, data, week):
 @st.cache_data(show_spinner=False)
 def _read_tasks_cached(name, data, week, circ):
     return read_task_list(data, name, week, circ)
+
+
+@st.cache_data(show_spinner=False)
+def _read_sfp_template(data):
+    return read_template(data)
 
 
 @st.cache_data(show_spinner=False)
@@ -834,3 +840,48 @@ if res is not None and tasks:
         "⬇ Download XLSX report", data=build_task_report_xlsx(res),
         file_name="simplex_tasks_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    st.markdown("**GroundStar shift plan (.sfp)**")
+    st.caption("Plan Control file with the shifts of this plan, to open/import in "
+               "GroundStar. Upload any shift plan (.sfp) of the same resource type saved "
+               "from Plan Control as the template: its settings are kept and its shift "
+               "list is replaced. Each shift is one worker on one day with its "
+               "qualification, code and times; flight tasks are not included – Plan "
+               "Control assigns them again.")
+    sfp_up = st.file_uploader("Template (.sfp)", type=["sfp"], key="sfp_tpl")
+    if sfp_up is not None:
+        st.session_state["sfp_tpl_bytes"] = sfp_up.getvalue()
+        st.session_state["sfp_tpl_name"] = sfp_up.name
+    tpl_bytes = st.session_state.get("sfp_tpl_bytes")
+    if tpl_bytes:
+        try:
+            tpl = _read_sfp_template(tpl_bytes)
+            st.caption(f"Template **{st.session_state.get('sfp_tpl_name', '')}**: resource type "
+                       f"`{tpl.resource_type}`, {tpl.checked_shifts} shifts read and checked "
+                       f"against the export format ✓")
+            depts = sorted({t.department for t in res.tasks if t.department})
+            occ_dept = {}
+            for t in res.tasks:
+                if t.department:
+                    occ_dept.setdefault(t.occupation, t.department)
+            if len(depts) > 1:
+                dep = st.selectbox("Department to export (one resource type per file)",
+                                   depts, index=depts.index(tpl.resource_type)
+                                   if tpl.resource_type in depts else 0, key="sfp_dep")
+                occs = {o for o, d in occ_dept.items() if d == dep}
+                rt = dep
+            else:
+                occs = None
+                rt = st.text_input("Resource type", depts[0] if depts else tpl.resource_type,
+                                   key="sfp_rt")
+            if rt != tpl.resource_type:
+                st.warning(f"The template is for `{tpl.resource_type}`, the shifts are for "
+                           f"`{rt}`. Use a template of the same resource type so its "
+                           "settings fit.")
+            recs = shift_records(res, tpl, resource_type=rt, occupations=occs)
+            st.download_button(
+                f"⬇ Download GroundStar shift plan ({len(recs)} shifts)",
+                data=build_sfp(tpl, recs), file_name=f"{rt}_SIMPLEX_SHIFTS.sfp",
+                mime="application/octet-stream")
+        except Exception as exc:
+            st.error(f"Template: {exc}")
