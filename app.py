@@ -31,6 +31,7 @@ from groundstar_rules import (
     parse_flight_number_groups, default_fn_text, engage_tasks,
 )
 from sfp_export import read_template, shift_records, build_sfp
+from pls_export import read_shift_codes, normalise_code, plan_to_pls, write_pls
 from task_solver import (
     TaskParams, TaskResult, solve_tasks, utilisation, task_hours,
     assignment_dataframe, workers_dataframe, build_task_report_xlsx,
@@ -110,6 +111,41 @@ with st.sidebar:
         force_excl = st.multiselect("Must exclude (solver will never use these)",
                                     options=[c for c in _all_codes if c not in set(force_incl)],
                                     default=[], key="force_excl")
+
+    with st.expander("🛫 GroundStar shift types only", expanded=False):
+        st.caption("Upload GroundStar's shift types – `Shifttype.Shifttype.GRule` from the "
+                   "scenario folder, a shift plan export (.pls / .sft) or a text list of "
+                   "codes like `0730-1430` – and the solver uses only those, so the "
+                   "import knows every shift code.")
+        gs_up = st.file_uploader("Shift types", type=["GRule", "pls", "sft", "txt", "csv"],
+                                 key="gs_codes_file", label_visibility="collapsed")
+        if gs_up is not None:
+            sig = (gs_up.name, gs_up.size)
+            if st.session_state.get("gs_codes_sig") != sig:
+                try:
+                    st.session_state["gs_codes"] = read_shift_codes(gs_up.getvalue())
+                    st.session_state["gs_codes_sig"] = sig
+                    st.session_state["use_gs_codes"] = bool(st.session_state["gs_codes"])
+                except Exception as exc:
+                    st.error(f"{gs_up.name}: {exc}")
+        gs_codes = st.session_state.get("gs_codes") or []
+        use_gs = st.checkbox("Plan with these shift types only",
+                             disabled=not gs_codes, key="use_gs_codes")
+        gs_extra_excl: list = []
+        if gs_codes:
+            allowed = {normalise_code(c) for c in gs_codes}
+            usable = [c for c in _all_codes if c in allowed]
+            st.caption(f"{len(gs_codes)} GroundStar shift types; **{len(usable)}** fit the "
+                       "shift settings above (min/max length, allowed times).")
+            if use_gs:
+                if not usable:
+                    st.warning("None of them fits the shift settings above – widen min/max "
+                               "shift or the allowed start/end times.")
+                gs_extra_excl = [c for c in _all_codes if c not in allowed]
+                missing = sorted(normalise_code(c) for c in gs_codes
+                                 if normalise_code(c) not in set(_all_codes))
+                if missing:
+                    st.caption("Not possible with the settings above: " + ", ".join(missing))
 
     with st.expander("📅 Entry / Exit limits per day", expanded=False):
         st.caption("Max distinct start times (entries) and end times (exits) "
@@ -228,7 +264,8 @@ params = TaskParams(
     occ_min_headcount_per_day=occ_min_hc if any(v is not None for v in occ_min_hc) else None,
     occ_headcount_per_shift_code=occ_sc_hc if any(v is not None for v in occ_sc_hc) else None,
     exclude_night_shifts=no_night, circular_week=circular,
-    force_include_shifts=force_incl or None, force_exclude_shifts=force_excl or None,
+    force_include_shifts=force_incl or None,
+    force_exclude_shifts=(list(force_excl) + gs_extra_excl) or None,
     allowed_slot_minutes=allowed_slot_minutes,
     briefing_min=int(briefing), closeout_min=int(closeout), travel_min=int(travel),
     breaks=breaks, assign_rounds=int(rounds), max_task_options=int(max_opts),
@@ -238,6 +275,8 @@ params = TaskParams(
 def _set_tasks(new_tasks, source, flights=None):
     if not source.startswith("flights"):
         st.session_state.pop("build_info", None)
+    st.session_state["plan_week_start"] = (st.session_state.get("fl_week_start")
+                                           if source.startswith("flights") else None)
     st.session_state["tasks"] = new_tasks
     st.session_state["flights"] = flights
     st.session_state["occ_names"] = occupations_of(new_tasks)
@@ -347,6 +386,7 @@ airline-specific rules override the defaults.
                     pick = st.selectbox("Week", labels, key="fl_week_inf")
                     week = weeks[labels.index(pick)]
                 events = build_events(legs, week)
+                st.session_state["fl_week_start"] = week.date()
                 for w in warns:
                     st.warning(w)
                 n_rot = sum(1 for e in events if e.chained)
@@ -358,11 +398,14 @@ airline-specific rules override the defaults.
                 fl = events_to_flights(events)
             else:
                 fl, warns, weeks = _read_flights_cached(f_up.name, raw, None)
+                if weeks:
+                    st.session_state["fl_week_start"] = weeks[0].date()
                 if len(weeks) > 1:
                     labels = [f"{w:%a %d %b %Y}" for w in weeks]
                     pick = st.selectbox("Week", labels, key="fl_week")
                     fl, warns, _ = _read_flights_cached(f_up.name, raw,
                                                         weeks[labels.index(pick)])
+                    st.session_state["fl_week_start"] = weeks[labels.index(pick)].date()
                 for w in warns:
                     st.warning(w)
                 st.caption(f"**{len(fl)}** flights read")
@@ -841,47 +884,92 @@ if res is not None and tasks:
         file_name="simplex_tasks_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    st.markdown("**GroundStar shift plan (.sfp)**")
-    st.caption("Plan Control file with the shifts of this plan, to open/import in "
-               "GroundStar. Upload any shift plan (.sfp) of the same resource type saved "
-               "from Plan Control as the template: its settings are kept and its shift "
-               "list is replaced. Each shift is one worker on one day with its "
-               "qualification, code and times; flight tasks are not included – Plan "
-               "Control assigns them again.")
-    sfp_up = st.file_uploader("Template (.sfp)", type=["sfp"], key="sfp_tpl")
-    if sfp_up is not None:
-        st.session_state["sfp_tpl_bytes"] = sfp_up.getvalue()
-        st.session_state["sfp_tpl_name"] = sfp_up.name
-    tpl_bytes = st.session_state.get("sfp_tpl_bytes")
-    if tpl_bytes:
-        try:
-            tpl = _read_sfp_template(tpl_bytes)
-            st.caption(f"Template **{st.session_state.get('sfp_tpl_name', '')}**: resource type "
-                       f"`{tpl.resource_type}`, {tpl.checked_shifts} shifts read and checked "
-                       f"against the export format ✓")
-            depts = sorted({t.department for t in res.tasks if t.department})
-            occ_dept = {}
-            for t in res.tasks:
-                if t.department:
-                    occ_dept.setdefault(t.occupation, t.department)
-            if len(depts) > 1:
-                dep = st.selectbox("Department to export (one resource type per file)",
-                                   depts, index=depts.index(tpl.resource_type)
-                                   if tpl.resource_type in depts else 0, key="sfp_dep")
-                occs = {o for o, d in occ_dept.items() if d == dep}
-                rt = dep
-            else:
-                occs = None
-                rt = st.text_input("Resource type", depts[0] if depts else tpl.resource_type,
-                                   key="sfp_rt")
-            if rt != tpl.resource_type:
-                st.warning(f"The template is for `{tpl.resource_type}`, the shifts are for "
-                           f"`{rt}`. Use a template of the same resource type so its "
-                           "settings fit.")
-            recs = shift_records(res, tpl, resource_type=rt, occupations=occs)
-            st.download_button(
-                f"⬇ Download GroundStar shift plan ({len(recs)} shifts)",
-                data=build_sfp(tpl, recs), file_name=f"{rt}_SIMPLEX_SHIFTS.sfp",
-                mime="application/octet-stream")
-        except Exception as exc:
-            st.error(f"Template: {exc}")
+    st.markdown("**GroundStar shift plan import (.pls)**")
+    st.caption("PLSHIFTS file for GroundStar's *shift plan import*: one line per worker "
+               "shift with date, code, times, resource type and qualification – the same "
+               "format GroundStar itself exports. Shifts ending at midnight are written "
+               "…-2359 as GroundStar does.")
+    depts = sorted({t.department for t in res.tasks if t.department})
+    occ_dept: dict = {}
+    for t in res.tasks:
+        if t.department:
+            occ_dept.setdefault(t.occupation, t.department)
+    pc1, pc2 = st.columns(2)
+    wk_default = st.session_state.get("plan_week_start")
+    if wk_default is None:
+        today = pd.Timestamp.today().date()
+        wk_default = today + pd.Timedelta(days=(7 - today.weekday()) % 7 or 7)
+    wk = pc1.date_input("Week starting (Monday)", wk_default, key="pls_week",
+                        help="Day 1 of the plan. Taken from the flight file when it has dates.")
+    if wk.weekday() != 0:
+        pc1.warning("The plan week runs Monday–Sunday; pick a Monday.")
+    if len(depts) > 1:
+        pls_rt = pc2.selectbox("Resource type (one per file)", depts, key="pls_dep")
+        pls_occs = {o for o, d in occ_dept.items() if d == pls_rt}
+    else:
+        pls_rt = pc2.text_input("Resource type", depts[0] if depts else "", key="pls_rt",
+                                help="GroundStar resource type, e.g. DIY_RAMP.")
+        pls_occs = None
+    if gs_codes and use_gs:
+        foreign = sorted({s.shift_code for o in result.occupations
+                          for s, c in zip(o.phase1.shifts, o.phase1.counts) if c}
+                         - {normalise_code(c) for c in gs_codes})
+        if foreign:
+            st.warning("Codes not in the GroundStar shift types: " + ", ".join(foreign))
+    elif gs_codes:
+        st.caption("Tip: tick *Plan with these shift types only* in the sidebar and run "
+                   "again so every code exists in GroundStar.")
+    if pls_rt.strip():
+        pf = plan_to_pls(res, wk, pls_rt.strip(), pls_occs,
+                         now=pd.Timestamp.now(tz="Europe/Istanbul").to_pydatetime())
+        st.download_button(
+            f"⬇ Download GroundStar shift plan import ({len(pf.shifts)} shifts)",
+            data=write_pls(pf),
+            file_name=f"{wk:%Y%m%d}_{pf.period_to:%Y%m%d}_{pls_rt.strip()}_SIMPLEX.pls",
+            mime="application/octet-stream", type="primary")
+    else:
+        st.caption("Enter the resource type to download.")
+
+    with st.expander("Plan Control document (.sfp) – advanced", expanded=False):
+        st.caption("Plan Control's own document, to **open** in Plan Control (it is not "
+                   "an import file – use the .pls above for the shift plan import). Upload "
+                   "a shift plan (.sfp) of the same resource type saved from Plan Control "
+                   "as the template; its settings are kept and its shift list replaced. "
+                   "Templates whose layout differs from the known one are refused.")
+        sfp_up = st.file_uploader("Template (.sfp)", type=["sfp"], key="sfp_tpl")
+        if sfp_up is not None:
+            st.session_state["sfp_tpl_bytes"] = sfp_up.getvalue()
+            st.session_state["sfp_tpl_name"] = sfp_up.name
+        tpl_bytes = st.session_state.get("sfp_tpl_bytes")
+        if tpl_bytes:
+            try:
+                tpl = _read_sfp_template(tpl_bytes)
+                st.caption(f"Template **{st.session_state.get('sfp_tpl_name', '')}**: resource type "
+                           f"`{tpl.resource_type}`, {tpl.checked_shifts} shifts read and checked "
+                           f"against the export format ✓")
+                depts = sorted({t.department for t in res.tasks if t.department})
+                occ_dept = {}
+                for t in res.tasks:
+                    if t.department:
+                        occ_dept.setdefault(t.occupation, t.department)
+                if len(depts) > 1:
+                    dep = st.selectbox("Department to export (one resource type per file)",
+                                       depts, index=depts.index(tpl.resource_type)
+                                       if tpl.resource_type in depts else 0, key="sfp_dep")
+                    occs = {o for o, d in occ_dept.items() if d == dep}
+                    rt = dep
+                else:
+                    occs = None
+                    rt = st.text_input("Resource type", depts[0] if depts else tpl.resource_type,
+                                       key="sfp_rt")
+                if rt != tpl.resource_type:
+                    st.warning(f"The template is for `{tpl.resource_type}`, the shifts are for "
+                               f"`{rt}`. Use a template of the same resource type so its "
+                               "settings fit.")
+                recs = shift_records(res, tpl, resource_type=rt, occupations=occs)
+                st.download_button(
+                    f"⬇ Download GroundStar shift plan ({len(recs)} shifts)",
+                    data=build_sfp(tpl, recs), file_name=f"{rt}_SIMPLEX_SHIFTS.sfp",
+                    mime="application/octet-stream")
+            except Exception as exc:
+                st.error(f"Template: {exc}")

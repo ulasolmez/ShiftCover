@@ -9,7 +9,7 @@ curve, the way task-based demand works in GroundStar / Plan Control.
 | Input | Workload curve (5-min staff need) | Tasks with a time window, duration, staff, qualification |
 | Decides | Shift counts | Shift counts **and** each task's start time |
 | Checks | Curve covered every 5 min | Every task done whole by one worker, with travel time, briefing, close-out and breaks |
-| Output | Shift types, coverage, ERP Shifttype | Same, plus task assignment, a worker Gantt and a GroundStar Plan Control shift plan (.sfp) |
+| Output | Shift types, coverage, ERP Shifttype | Same, plus task assignment, a worker Gantt and a GroundStar shift plan import file (.pls) |
 
 ## Input
 
@@ -49,16 +49,26 @@ start/end times, night-shift exclusion, circular week, force include/exclude,
 max unique shift types, entry/exit limits, headcount limits (combined, per
 occupation, per shift code) and the transition penalty.
 
-## GroundStar shift plan export (.sfp)
+## GroundStar shift plan import (.pls)
 
-After a run, upload any Plan Control shift plan (.sfp) of the same resource
-type as a template and download the plan as `<RESOURCE>_SIMPLEX_SHIFTS.sfp`.
-The template's settings (everything before the shift list) are kept; the shift
-list is replaced by one shift per worker per day with its qualification, shift
-code, times and valid weekdays, plus the day task Plan Control uses to place a
-shift on its day (day 1 = Monday). Flight tasks are not written – Plan Control
-assigns them again. Before use, every shift and day task of the template is
-rebuilt byte for byte to make sure the file version matches.
+After a run, download the plan as `<from>_<to>_<RESOURCE>_SIMPLEX.pls` and load
+it in GroundStar with **Shift plan import** (the dialog asks for a .pls or .nam
+file). The file is GroundStar's `PLSHIFTS` text format (UTF-16, one line per
+shift per day: id, shift code, date, begin, end, resource type,
+qualification). Pick the planning week (it defaults to the INFORM export's
+week) and the resource type. The writer reproduces the six PLSHIFTS files from
+the user's scenario folders byte for byte.
+
+**Plan with GroundStar's shift types only.** In the sidebar, upload
+`Shifttype.Shifttype.GRule` (or any .pls/.sft) from a GroundStar scenario. The
+solver then only uses shift codes that exist there, so every imported shift
+matches a GroundStar shift type. Tasks that no such shift can reach (for
+example, a task that starts right after a shift start and leaves no room for
+the briefing) are listed and left out.
+
+The older Plan Control document export (.sfp) is still in the app under
+*advanced*. It needs a .sfp template and is for opening in Plan Control, not
+for the shift plan import.
 
 ## Run
 
@@ -78,7 +88,8 @@ part of the `ortools` wheel.
 | `app.py` | Streamlit front-end (task-based) |
 | `tasks.py` | Tasks, flights, task rules, imports, sample schedule |
 | `groundstar_rules.py` | INFORM flight export + GroundStar engage-rule export → tasks |
+| `pls_export.py` | GroundStar shift plan import (.pls / PLSHIFTS) reader and writer, shift-type reader |
 | `sfp_export.py` | Plan Control shift plan (.sfp) writer |
 | `task_solver.py` | Model, assignment check, repair, reports |
 | `solver.py` | Shared shift machinery from the curve-based Simplex |
-| `test_task_solver.py`, `test_groundstar_rules.py`, `test_sfp_export.py` | Tests for the task-based parts |
+| `test_task_solver.py`, `test_groundstar_rules.py`, `test_sfp_export.py`, `test_pls_export.py` | Tests for the task-based parts |
